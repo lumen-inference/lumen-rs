@@ -1,0 +1,10 @@
+[package]
+name = "lumen-tensor"
+description = "TensorRef, TensorView, LtqLinear, RowTable, DenseLinear, ExpertBank."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lumen-core.workspace = true
+lumen-mem.workspace = true

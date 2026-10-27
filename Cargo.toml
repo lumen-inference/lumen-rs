@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+
+[workspace.dependencies]
+lumen-core = { path = "crates/lumen-core" }
+lumen-kabi = { path = "crates/lumen-kabi" }
+lumen-config = { path = "crates/lumen-config" }
+lumen-mem = { path = "crates/lumen-mem" }
+lumen-tensor = { path = "crates/lumen-tensor" }
+lumen-format = { path = "crates/lumen-format" }
+lumen-ltq = { path = "crates/lumen-ltq" }
+lumen-backend = { path = "crates/lumen-backend" }
+lumen-ref = { path = "crates/lumen-ref" }
+lumen-cpu = { path = "crates/lumen-cpu" }
+lumen-cuda-kernels = { path = "crates/lumen-cuda-kernels" }
+lumen-cuda = { path = "crates/lumen-cuda" }
+lumen-models = { path = "crates/lumen-models" }
+lumen-exec = { path = "crates/lumen-exec" }
+lumen-media = { path = "crates/lumen-media" }
+lumen-chat = { path = "crates/lumen-chat" }
+lumen-engine = { path = "crates/lumen-engine" }
+lumen-quantize = { path = "crates/lumen-quantize" }
+lumen-server = { path = "crates/lumen-server" }
+lumen-cli = { path = "crates/lumen-cli" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

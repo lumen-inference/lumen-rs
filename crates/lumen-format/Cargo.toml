@@ -1,0 +1,10 @@
+[package]
+name = "lumen-format"
+description = "The .ltq container (header, tensor table, file mmap) and the quantizer's BF16 input (safetensors, index.json); manifest; no architecture knowledge."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lumen-core.workspace = true
+lumen-tensor.workspace = true

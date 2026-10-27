@@ -1,0 +1,9 @@
+[package]
+name = "lumen-chat"
+description = "Tokenizer, chat templates, Harmony, reasoning and tool-call parsers, multimodal messages, detokenization."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lumen-media.workspace = true

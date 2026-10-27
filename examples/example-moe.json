@@ -1,0 +1,65 @@
+{
+  "model": {
+    "path": "models/qwen3.8-flash-next/model.ltq",
+    "compute": "cuda:0",
+    "store": "vram:0",
+    "input-layer": {
+      "store": "ram:0"
+    },
+    "ple": {
+      "table": {
+        "store": "disk"
+      }
+    },
+    "hidden-layers": {
+      "attention": {
+        "kv-cache": {
+          "store": "ram:0"
+        },
+        "indexer": {
+          "keys": {
+            "store": "ram:0"
+          }
+        }
+      },
+      "moe": {
+        "routed-experts": {
+          "compute": "cpu:0", "store": "ram:0", "prefill-compute": "cuda:0"
+        }
+      },
+      "32-47": {
+        "moe": {
+          "routed-experts": {
+            "compute": "cuda:0", "store": "vram:0"
+          }
+        }
+      }
+    },
+    "sampling": {
+      "temperature": 0.6,
+      "top-p": 0.95,
+      "top-k": 20,
+      "min-p": 0.0
+    }
+  },
+
+  "chat-template": {
+    "kwargs": {
+      "enable_thinking": true
+    }
+  },
+
+  "context": {
+    "size": 262144
+  },
+
+  "cuda": {
+    "prefill-chunk-size": 4096
+  },
+
+  "disk": {
+    "io-threads": 4
+  },
+
+  "attention-mechanism": "flash-attention"
+}

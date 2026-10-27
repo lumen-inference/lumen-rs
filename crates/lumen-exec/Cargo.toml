@@ -1,0 +1,14 @@
+[package]
+name = "lumen-exec"
+description = "Scheduler: logical graph + PlacementPlan -> Program; ceiling model (Program::floor); auto-placement."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Talks to backends only through lumen-backend's Executor; lumen-engine wires up the concrete ones.
+[dependencies]
+lumen-core.workspace = true
+lumen-config.workspace = true
+lumen-tensor.workspace = true
+lumen-backend.workspace = true
+lumen-models.workspace = true

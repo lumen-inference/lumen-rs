@@ -1,0 +1,58 @@
+{
+  "model": {
+    "path": "models/qwen3.8-27b/model.ltq",
+    "compute": "cuda:0",
+    "store": "vram:0",
+    "input-layer": {
+      "store": "ram:0"
+    },
+    "hidden-layers": {
+      "dense-mlp": {
+        "compute": "cpu:0", "store": "ram:0", "prefill-compute": "cuda:0"
+      },
+      "36-63": {
+        "dense-mlp": {
+          "compute": "cuda:0", "store": "vram:0"
+        }
+      }
+    },
+    "sampling": {
+      "temperature": 0.6,
+      "top-p": 0.95,
+      "top-k": 20,
+      "min-p": 0.0
+    }
+  },
+
+  "chat-template": {
+    "kwargs": {
+      "enable_thinking": true
+    }
+  },
+
+  "context": {
+    "size": 262144
+  },
+
+  "kv-quantization": {
+    "k-bits": 8,
+    "v-bits": 5
+  },
+
+  "cuda": {
+    "prefill-chunk-size": 512,
+    "cuda-graphs": false
+  },
+
+  "cpu": {
+    "threads": 16
+  },
+
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "max-concurrent-requests": 1
+  },
+
+  "attention-mechanism": "flash-attention"
+}

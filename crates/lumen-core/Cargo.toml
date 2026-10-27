@@ -1,0 +1,8 @@
+[package]
+name = "lumen-core"
+description = "DType (incl. quant types), Shape, Device, MemLoc, ComponentPath, errors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]

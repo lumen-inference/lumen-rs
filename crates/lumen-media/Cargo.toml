@@ -1,0 +1,9 @@
+[package]
+name = "lumen-media"
+description = "Images and audio: decoding, resizing, patching, frames."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lumen-core.workspace = true

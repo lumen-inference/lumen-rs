@@ -1,0 +1,9 @@
+[package]
+name = "lumen-config"
+description = "Serde schema, cascade, layer-range grammar, validation -> PlacementPlan."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lumen-core.workspace = true

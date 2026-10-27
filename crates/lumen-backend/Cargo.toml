@@ -1,0 +1,10 @@
+[package]
+name = "lumen-backend"
+description = "Operator set Op, trait Executor, HwProfile, kernel registry."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lumen-core.workspace = true
+lumen-tensor.workspace = true

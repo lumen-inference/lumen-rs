@@ -1,0 +1,11 @@
+[package]
+name = "lumen-models"
+description = "Architecture registry by model_type; architecture -> component tree, logical graph from shared block builders, name aliases, MoE normalization."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lumen-core.workspace = true
+lumen-tensor.workspace = true
+lumen-format.workspace = true

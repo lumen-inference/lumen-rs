@@ -1,0 +1,8 @@
+[package]
+name = "lumen-kabi"
+description = "#[repr(C)] kernel parameters and format constants; the lumen_kabi.h header for the .cu side is generated from them by cbindgen."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
