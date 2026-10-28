@@ -1,21 +1,38 @@
-# `qwen4_exp` (Qwen3.8-Flash-Next)
+# `qwen4_exp` Architecture (`Qwen3.8-Flash-Next`)
 
-Oct 27, 2026 · @Vemloir
+The **`qwen4_exp`** architecture (`Qwen3.8-Flash-Next`) extends the hybrid [`qwen3_next` / `qwen3_5_moe`](qwen3_next.md) foundation with three additional modules: Query-Sparse Attention (`QSA`), four-stream residual connections (`Hyper-Connections`), and n-gram Per-Layer Embeddings (`PLE`).
 
-| What | Config | What the engine needs |
-| --- | --- | --- |
-| 36 Gated DeltaNet layers and 12 full ones, every 4th is full | `layer_types`, `linear_*`, `full_attention_interval: 4` | a DeltaNet kernel, recurrent state ([section 3 of architecture.md](../architecture.md#3-memory-storage-locations-and-access-modes)) |
-| QSA in full layers | `indexer_*`: 4 heads of 128, a 2048-token budget, 4-token blocks | the indexer leaves each query ≤ 512 blocks plus the incomplete tail; the selection is ANDed with the causal mask. Attention reads a bounded number of positions, so the KV of full layers at long context could stay in RAM with the selected blocks fetched — an offload candidate |
-| Hyper-connections | `hc_count: 4`, `hc_lowrank: 320` | the residual is 4 streams; before a sub-block they are mixed into its input, the output is injected back (`block_inject_weight`), and the streams are collapsed before the final norm (`hyper_connection_mixer`) |
-| N-gram PLE | `ple_*`, `ngram_*` | an on-disk `RowTable` + `Fetch`; the PLE layer: a key per stream and a shared value, a gate from the stream, a dilated causal conv (kernel 4, dilation 3) |
-| MoE | 512 experts, top-10, intermediate 640; a 640-wide shared expert with a sigmoid gate | experts almost entirely on the CPU |
-| MTP | 1 layer: attention, MoE, hyper-connections | the `Mtp` drafter, its own place in the plan |
-| M-RoPE | `mrope_section: [11, 11, 10]`, interleaved, partial 0.25 of head\_dim 256 | \[3, T\] positions |
-| Vision | a 27-block ViT | [section 7 of architecture.md](../architecture.md#7-multimodality) |
+---
 
-**The n-gram table.** In Qwen3.8-Flash-Next a position yields (ngram\_size − 1) × heads\_per\_ngram = 2 × 8 = 16 hashed rows of 160 values; together they form a 2560-wide vector. The table is 16 heads of ~20M rows each (head sizes are derived from `ngram_vocab_size_base`): 102 GB in bf16, ~52 GB in int8 (162 bytes per row with the scale), ~28 GB as TCQ4X rings (86 bytes per row).
+## 1. Summary of Parameters and Modules
 
-## Sources
+| Component | `config.json` Parameters | Engine Requirements |
+| :--- | :--- | :--- |
+| **3 : 1 Hybrid Backbone** | 48 layers: 36 `GatedDeltaNet` layers and 12 `full_attention` layers (`full_attention_interval: 4`) | `DeltaNet` kernel and recurrent state slot in `StatePool` ([Section 4 of architecture.md](../architecture.md#4-memory-subsystem-four-classes-of-data)) |
+| **Query-Sparse Attention (`QSA`) in full layers** | `indexer_*`: 4 heads of dim 128, 2048-token budget, 4-token blocks | The indexer selects $\le 512$ blocks plus the incomplete tail per query, intersected with the causal mask. Because attention reads at most 2048 positions, the full-layer KV cache at long context can reside in system RAM (`ZeroCopy`) |
+| **Multi-Stream `Hyper-Connections`** | `hc_count: 4`, `hc_lowrank: 320` | The `residual` state consists of 4 parallel streams; streams are mixed into a single input vector before each sub-block (`HcMix`), the sub-block output is injected back via `block_inject_weight` (`HcInject`), and all streams are reduced before the final norm (`hyper_connection_mixer`) |
+| **N-Gram `PLE` Module** | `ple_*`, `ngram_*` | `RowTable` descriptor on NVMe disk (`store: "disk"`) + ahead-of-time `Fetch` operator; within each layer — per-stream key projection, shared value projection, gate, and dilated causal convolution (kernel 4, dilation 3) |
+| **Mixture of Experts (`MoE`)** | 512 routed experts (`top-10`, `intermediate_size: 640`) + 1 shared expert (640) with sigmoid gate | Offloading routed experts to system RAM on CPU |
+| **`MTP` Draft Layer** | 1 additional layer (attention, MoE, and Hyper-Connections) | Speculative `Mtp` drafter with its own placement node (`mtp`) |
+| **`M-RoPE` Positional Encoding** | `mrope_section: [11, 11, 10]`, interleaved, `partial 0.25` of `head_dim = 256` | 3D position coordinates $[3, T]$ |
+| **Vision Encoder** | 27-block ViT | Separate encoder `Program` ([Section 8 of architecture.md](../architecture.md#8-generation-runtime-engine-speculative-decoding-and-multimodality)) |
 
-- [Qwen/Qwen3.8-Flash-Next: config.json, model.safetensors.index.json](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
-- [transformers 5.16.0: Qwen4-Exp (GatedResidual, QSA, PLE)](https://newreleases.io/project/pypi/transformers/release/5.16.0)
+---
+
+## 2. N-Gram Lookup Table Structure and Disk Offloading
+
+At each token position, the model computes $(\text{ngram\_size} - 1) \times \text{heads\_per\_ngram} = 2 \times 8 = 16$ hash indices (8 bigram heads and 8 trigram heads). Each head looks up a 160-element row, and the 16 rows concatenate into a vector of dimension $16 \times 160 = 2560$.
+
+The full table comprises 16 partitions of ~20 million rows each (exact partition sizes are derived from `ngram_vocab_size_base`):
+- in `bf16`, the table occupies **102 GB**;
+- in `int8` (162 bytes per row with scale) — **~52 GB**;
+- in `TCQ4X` LTQ rings (86 bytes per row) — **~28 GB**.
+
+Generating a single token requires reading only $16 \times 86 = 1376\text{ bytes}$ ($\le 1.4\text{ KB}$) from this table, and all 16 row indices depend solely on token IDs known immediately after sampling. This allows the table to remain on NVMe storage (`"ple": { "table": { "store": "disk" } }`) while background I/O threads prefetch the required rows via `Fetch` off the critical path.
+
+---
+
+## References
+
+- Model configuration: [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
+- Reference implementations of Qwen4-Exp modules (`GatedResidual`, `QSA`, `PLE`) in `transformers 5.16.0` and `exllamav3` (`modules/qsa_indexer.py`, `modules/hyperconnections.py`, `modules/ngram_embedding.py`, `modules/ple.py`).

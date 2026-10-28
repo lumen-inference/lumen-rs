@@ -1,29 +1,48 @@
-# Архитектуры моделей
+# Архитектуры поддерживаемых моделей и их модули (`lumen-models`)
 
-Oct 27, 2026 · @Vemloir
+В `lumen-rs` каждое семейство моделей в крейте `lumen-models` собирается из общих **архитектурных модулей (Modules)** ([раздел 1 architecture.md](../architecture.md#1-четыре-уровня-модульности)). Специфика конкретных моделей передаётся через параметры модулей и операторов, не затрагивая код планировщика и вычислительных бэкендов.
 
-Что каждое семейство требует от движка. Особенности моделей — параметры операторов, а не отдельный код исполнителя ([раздел 8 architecture.md](../architecture.md#8-расширяемость)). У семейства с заметными особенностями свой файл:
+Подробное описание семейств со специализированными модулями вынесено в отдельные файлы:
+- **[qwen3_next.md](qwen3_next.md)** — гибридное семейство `qwen3_next`, `qwen3_5_dense` (`qwen3_5`) и `qwen3_5_moe` (чередование 3:1 линейного внимания `Gated DeltaNet` и полного внимания с гейтом).
+- **[qwen4_exp.md](qwen4_exp.md)** — архитектура `qwen4_exp` (`Qwen3.8-Flash-Next`: разреженное внимание `QSA`, 4-поточные остаточные связи `Hyper-Connections` и таблица n-грамм `PLE`).
+- **[gemma4.md](gemma4.md)** — семейство `Gemma 4` (реконструкция $K = V$, пропорциональный `p-RoPE`, общий KV-кэш на финальных слоях, `PLE` и параллельная работа плотного MLP с MoE).
 
-- [qwen3_next.md](qwen3_next.md) — `qwen3_next`, `qwen3_5_dense` (`qwen3_5`), `qwen3_5_moe`
-- [qwen4_exp.md](qwen4_exp.md) — `qwen4_exp` (Qwen3.8-Flash-Next)
-- [gemma4.md](gemma4.md) — Gemma 4
+---
 
-## Семейства
+## 1. Базовые архитектурные модули
 
-| Семейство | Что требует от движка |
-| --- | --- |
-| Llama, Qwen3 | базовый плотный путь |
-| Qwen3-MoE | банки экспертов, softmax → top-k |
-| `qwen3_next` | гибрид 3:1 Gated DeltaNet (слитые `in_proj_qkvz`/`ba` по K-группам) + Gated Attention (`q_proj` ×2 с выходным σ-гейтом), zero-centered RMSNorm (`1 + w`), `RMSNormGated`, MoE с `shared_expert_gate`, partial 1D RoPE 0.25, MTP |
-| `qwen3_5_dense` (`qwen3_5`) | гибрид 3:1 Gated DeltaNet (раздельные `in_proj_{qkv,z,b,a}`) + Gated Attention, плотный SwiGLU MLP на каждом слое, zero-centered RMSNorm, interleaved M-RoPE `[11, 11, 10]` (partial 0.25), ViT с axial 2D RoPE, MTP; например, Qwen3.8-27B: 64 слоя (48 : 16), hidden 5120 |
-| `qwen3_5_moe` | гибрид 3:1 Gated DeltaNet (раздельные `in_proj_{qkv,z,b,a}`) + Gated Attention, MoE (роутер + routed-эксперты + общий эксперт с `shared_expert_gate`), M-RoPE, ViT, MTP |
-| gpt-oss | синки, чередование sliding/full по `layer_types`, YaRN, SwiGLU с clamp 7.0, bias в проекциях, Harmony |
-| Qwen3.8-Flash-Next (`qwen4_exp`) | надстройка над `qwen3_next`/`qwen3_5_moe`: QSA в full-слоях, hyper-connections, n-gram PLE, MTP, M-RoPE, зрение |
-| Gemma 4 | K = V, p-RoPE, общий KV, PLE, плотный MLP параллельно MoE, мультимодальность без энкодера у 12B |
+Слои трансформерных и гибридных моделей строятся из следующих типовых модулей:
 
-## Энкодеры
+| Категория | Модуль | Назначение | Где используется |
+| :--- | :--- | :--- | :--- |
+| **Работа с контекстом (Sequence Mixers)** | **`FullAttention` / `SlidingAttention`** | Причинное внимание по всему контексту или по скользящему окну последних $W$ токенов со страничным пулом `KvPool`. | Все семейства моделей |
+| | **`SparseAttention` (QSA)** | Разреженное внимание с индексатором: перед основным вниманием лёгкий индексатор оценивает блоки по 4 токена и выбирает $\le 512$ релевантных блоков, позволяя вынести основной KV-кэш в системную RAM (`ZeroCopy`). | `Qwen3.8-Flash-Next` (`qwen4_exp`) |
+| | **`GatedDeltaNet` (GDN)** | Линейное рекуррентное внимание, поддерживающее матрицу состояния фиксированного размера (~3 МБ на слой), обновляемую за $O(1)$ на каждом токене вместо растущего KV-кэша. | `qwen3_next`, `qwen3_5_dense`, `qwen3_5_moe`, `Qwen3.8-Flash-Next` |
+| **Преобразование каналов (FFN)** | **`DenseMlp`** | Плотный полносвязный блок (`SwiGLU` или `GeGLU`). | `Llama`, `Qwen3`, `qwen3_5_dense`, `Gemma 4` |
+| | **`MoE` (Mixture of Experts)** | Смесь экспертов: роутер выбирает `top-k` экспертов из банка `ExpertBank`, плюс опционально работает общий эксперт (`Shared Expert`). Основной узел для оффлоада на CPU. | `Qwen3-MoE`, `qwen3_next`, `qwen3_5_moe`, `Qwen3.8-Flash-Next`, `Gemma 4 26B-A4B`, `gpt-oss` |
+| **Адаптеры и остаточные связи** | **`PLE` (Per-Layer Embeddings)** | Таблица послойных эмбеддингов или n-грамм (`RowTable`), индексируемая по ID токенов и подходящая для оффлоада на NVMe-диск (`Fetch`). | `Gemma 4 E2B/E4B`, `Qwen3.8-Flash-Next` |
+| | **`HyperConnections`** | Многопоточная остаточная связь (4 параллельных потока `residual`, смешиваемых перед каждым подблоком). | `Qwen3.8-Flash-Next` |
 
-| Схема | Модели | Что считает энкодер |
-| --- | --- | --- |
-| Энкодер-башня | `qwen3_5_dense`, `qwen3_5_moe`, Qwen3.8-Flash-Next: ViT на 27 блоков (axial 2D RoPE), hidden 1152, патч 16, merger 2×2 → hidden декодера, видео с temporal patch 2. Gemma 4 26B и 31B: ViT на 27 слоёв, hidden 1152. Gemma 4 E2B/E4B: ViT на 16 слоёв; аудио — conformer на 12 слоёв с чанковым attention | двунаправленное attention, без KV, раз на картинку или аудиофрагмент; компоненты `vision-tower`, `audio-tower` |
-| Без энкодера | Gemma 4 12B (`Gemma4Unified…`) | картинка режется на патчи 48×48: LayerNorm → Linear 6912 → 3840 → LayerNorm → + факторизованные позиционные эмбеддинги (x, y) → LayerNorm → RMSNorm → Linear; до 280 токенов на картинку. Аудио — сырые кадры по 640 отсчётов (40 мс при 16 кГц) → RMSNorm → Linear 640 → 3840, до 750 токенов. Остальную работу делает сам декодер |
+---
+
+## 2. Сводная таблица семейств моделей
+
+| Семейство | Требуемые модули и параметры |
+| :--- | :--- |
+| **`Llama`, `Qwen3`** | Базовый плотный путь: `FullAttention` + `DenseMlp` (`SwiGLU`) + `RMSNorm` + `RoPE`. |
+| **`Qwen3-MoE`** | `FullAttention` + банк экспертов `MoE` (маршрутизация `softmax → top-k`). |
+| **`qwen3_next`** | Гибрид 3:1 `GatedDeltaNet` (слитые проекции `in_proj_qkvz`/`ba` по $K$-группам) + `Gated Attention` (`q_proj` удвоенной ширины с выходным $\sigma$-гейтом), `zero-centered RMSNorm` (`1 + w`), `RMSNormGated`, `MoE` с `shared_expert_gate`, частичный 1D RoPE 0.25, `MTP`. |
+| **`qwen3_5_dense`** (`qwen3_5`) | Гибрид 3:1 `GatedDeltaNet` (раздельные `in_proj_{qkv,z,b,a}`) + `Gated Attention`, плотный `DenseMlp` на каждом слое, `zero-centered RMSNorm`, трёхмерный `M-RoPE` `[11, 11, 10]` (partial 0.25), `ViT` с осевым 2D RoPE, `MTP` (например, `Qwen3.8-27B`: 64 слоя 48:16, hidden 5120). |
+| **`qwen3_5_moe`** | Гибрид 3:1 `GatedDeltaNet` (раздельные проекции) + `Gated Attention`, `MoE` (маршрутизируемые эксперты + общий эксперт с `shared_expert_gate`), `M-RoPE`, `ViT`, `MTP`. |
+| **`gpt-oss`** | Обучаемые синки внимания, чередование `sliding`/`full` по `layer_types`, `YaRN`, `SwiGLU` с ограничением 7.0 (`clamp`), `bias` в проекциях, чат-формат `Harmony`. |
+| **`Qwen3.8-Flash-Next`** (`qwen4_exp`) | Надстройка над `qwen3_next` / `qwen3_5_moe`: разреженное внимание `QSA` в full-слоях, `Hyper-Connections`, таблица n-грамм `PLE`, `MTP`, `M-RoPE`, `ViT`. |
+| **`Gemma 4`** | Реконструкция $K = V$, пропорциональный `p-RoPE`, общий KV-кэш финальных слоёв, `PLE`, плотный MLP параллельно с MoE (у `26B-A4B`), бесбашенная мультимодальность у `12B`. |
+
+---
+
+## 3. Мультимодальные энкодеры
+
+| Схема | Модели | Устройство энкодера |
+| :--- | :--- | :--- |
+| **Энкодер-башня (`vision-tower`, `audio-tower`)** | `qwen3_5_dense`, `qwen3_5_moe`, `Qwen3.8-Flash-Next`: ViT на 27 блоков (осевой 2D RoPE), hidden 1152, патч 16, слияние $2 \times 2 \to$ hidden декодера, видео с временным патчем 2.<br/>`Gemma 4 26B / 31B`: ViT на 27 слоёв, hidden 1152.<br/>`Gemma 4 E2B / E4B`: ViT на 16 слоёв; аудио — Conformer на 12 слоёв с чанковым вниманием. | Двунаправленное внимание без KV-кэша; выполняется один раз на изображение или аудиофрагмент с кэшированием выхода по хэшу содержимого. |
+| **Прямая проекция патчей (без башни энкодера)** | `Gemma 4 12B` (`Gemma4Unified…`) | Изображение нарезается на патчи $48 \times 48$: `LayerNorm → Linear 6912 → 3840 → LayerNorm → + позиционные эмбеддинги (x, y) → LayerNorm → RMSNorm → Linear` (до 280 токенов на картинку). Аудио — кадры по 640 отсчётов (40 мс при 16 кГц) `→ RMSNorm → Linear 640 → 3840` (до 750 токенов). Дальнейшую обработку выполняет сам декодер. |

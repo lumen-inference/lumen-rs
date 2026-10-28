@@ -1,34 +1,58 @@
-# lumen-rs — Chat Layer, CLI, and Server
+# External Interfaces: Chat Layer, CLI, and HTTP Server
 
-Oct 27, 2026 · @Vemloir
+The external interface layer on top of [`Engine`](architecture.md#8-generation-runtime-engine-speculative-decoding-and-multimodality) is divided into three crates:
+- **`lumen-chat`** — formats conversational messages (text, images, audio, system prompts, and tool definitions) into tokens and parses generated token streams into typed events.
+- **`lumen-cli`** — the `lumen` binary for running generation, inspecting placement plans, benchmarking hardware, and quantizing models.
+- **`lumen-server`** — an `axum` HTTP server compatible with the **OpenAI API** and **Anthropic Messages API** protocols.
 
-The engine's external interface on top of `Engine` ([section 6 of architecture.md](architecture.md#6-runtime-generation-core-and-speculative-decoding)): the chat layer (`lumen-chat`), the `lumen` binary and the HTTP server (`lumen-server`).
+---
 
-**Chat layer** (`lumen-chat`)
+## 1. Chat Layer and Output Parsing (`lumen-chat`)
 
-- Tokenizer — `tokenizers`; it and the template come from the `.ltq` header (`tokenizer`, `chat_template`). Template — via minijinja with `minijinja-contrib` (pycompat for Python string methods in HF templates), plus `raise_exception` and `strftime_now`.
-- Template kwargs: `chat-template.kwargs` from the config, overlaid by request parameters (`reasoning_effort` from OpenAI, `thinking` from Anthropic).
-- Multimodal message parts (images, audio, video) go through `lumen-media`; the template inserts as many placeholder tokens as the preprocessor returned.
-- One output parser per family: Harmony for gpt-oss via `openai-harmony` (analysis, commentary, final channels; `to=functions.*` calls), `<think>` and `<tool_call>` for Qwen. It works on special-token ids, not text.
-- Incremental detokenization with prefix and read offsets: incomplete UTF-8 never leaks out.
+All metadata required for prompt formatting is stored directly inside the `.ltq` file header ([see container specification](ltq-format.md#6-row-slices-and-the-ltq-container)): the tokenizer vocabulary (`tokenizer`), chat template (`chat_template`), and media preprocessor configuration (`processor_config`).
 
-**CLI** (`lumen`)
+1. **Tokenization and template rendering:**
+   Tokenization is handled by the `tokenizers` crate. The chat template is rendered via `minijinja` with `minijinja-contrib` (`pycompat` for Python string methods used in HuggingFace templates), plus `raise_exception` and `strftime_now`.
+2. **Template arguments (`kwargs`):**
+   Default values are read from the config's `chat-template.kwargs` section and merged with per-request parameters (`reasoning_effort` in OpenAI API or `thinking` in Anthropic API).
+3. **Multimodal messages:**
+   Images, video, and audio are preprocessed by `lumen-media`; the template inserts the corresponding number of placeholder tokens into the token stream.
+4. **Incremental detokenization and special block parsing:**
+   - The detokenizer tracks prefix and read offsets, holding incomplete multi-byte UTF-8 sequences until the next token arrives.
+   - Reasoning blocks and tool calls are parsed by **special token IDs** rather than text matching: `gpt-oss` models use `openai-harmony` (channels `analysis`, `commentary`, `final`, and `to=functions.*` calls), while Qwen models use the `<think>` and `<tool_call>` special tokens.
 
-- `run -c cfg.json -p "…"` and `chat`: the `Engine::step` loop on the main thread, `stdout().lock()` and a flush after every token.
-- `serve`: the server from the `server` section.
-- `inspect`: the resolved plan per layer with the source of every value; memory per device and class (weights, KV per token, state per sequence); bytes per resource per token and both step ceilings ([performance.md](performance.md)).
-- `probe`: measures the hardware ceilings → `hw-profile.json`.
-- `bench`: pp and tg in tokens per second and η — per step, per resource, and per segment; `--trace` writes a segment timeline in Chrome trace format.
-- `pack`: writes the model in its final layouts ([section 4 of architecture.md](architecture.md#4-weights-descriptors-and-loading)).
-- Speculative decoding: `--draft cfg.json`, `--spec-k 4`, `--ngram`, `--mtp`.
+`lumen-chat` emits a unified stream of `ChatEvent` items:
+- `ReasoningDelta(String)`
+- `TextDelta(String)`
+- `ToolCallStart`, `ToolArgsDelta`, `ToolCallEnd`
+- `Done { reason, usage }`
 
-**Server** (`lumen-server`)
+---
 
-The `server` config section sets `host`, `port`, and `max-concurrent-requests` — how many sequences the engine runs at once; the rest wait in a queue. The engine thread receives `Command::{Submit, Cancel, Shutdown}` via `std::sync::mpsc` and sends events to the request's `tokio::sync::mpsc::UnboundedSender` — sending from a plain thread is safe. The axum handler turns the receiver into SSE. Client disconnects → receiver dropped → `send` returns an error → the engine cancels the sequence and frees its KV.
+## 2. Command-Line Interface (`lumen-cli`)
 
-Both APIs are adapters over one internal model: `ChatRequest` in, a stream of `ChatEvent` out (`ReasoningDelta`, `TextDelta`, `ToolCallStart`, `ToolArgsDelta`, `ToolCallEnd`, `Done`).
+| Command | Purpose |
+| :--- | :--- |
+| **`lumen run`** | Single-prompt generation (`lumen run -c cfg.json -p "…"`). Runs the `Engine::step()` loop synchronously on the main thread, flushing `stdout` after each token. |
+| **`lumen chat`** | Interactive multi-turn terminal chat preserving the KV prefix cache across turns. |
+| **`lumen serve`** | Starts the HTTP server using parameters from the config's `server` section. |
+| **`lumen inspect`** | Prints the resolved per-layer `PlacementPlan` with the JSON rule source for every value, memory usage by device and class (weights, KV per token, state per sequence), per-token resource byte counts, and both hardware step ceilings ([performance.md](performance.md)). |
+| **`lumen probe`** | Measures hardware bandwidths and latencies and saves the profile to `hw-profile.json`. |
+| **`lumen bench`** | Measures prompt processing (`pp`) and token generation (`tg`) throughput in tokens/s along with hardware efficiency $\eta$ per step, resource, and segment; `--trace` writes a Chrome Trace timeline. |
+| **`lumen pack`** | Repacks `.ltq` model weights into target backend layouts (`CpuBand16` / `GpuWarp`) on disk ([Section 6 of architecture.md](architecture.md#6-weight-representations-and-model-loading)). |
+| **`lumen quantize`** | Quantizes a BF16 (`safetensors`) checkpoint into a `.ltq` container. |
 
-| API | Endpoints | Stream | Notes |
-| --- | --- | --- | --- |
-| OpenAI | `POST /v1/chat/completions`, `GET /v1/models` | SSE `chat.completion.chunk`, final `data: [DONE]`; usage with `stream_options.include_usage` | reasoning → `reasoning_content`; `tool_calls` with index and streamed `arguments`; `developer` role = system; images as `image_url` parts (data URL), audio as `input_audio` |
-| Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` | `message_start` → `content_block_start/delta/stop` → `message_delta` → `message_stop`, plus `ping` | separate `system` field, `max_tokens` required; `thinking_delta`, `input_json_delta`; stop\_reason: end\_turn, max\_tokens, stop\_sequence, tool\_use; `budget_tokens` force-closes reasoning via a sampler hook; images as base64 `image` blocks |
+Speculative decoding flags: `--draft cfg.json`, `--spec-k 4`, `--ngram`, `--mtp`.
+
+---
+
+## 3. HTTP Server (`lumen-server`)
+
+The `server` configuration section defines `host`, `port`, and `max-concurrent-requests` (the maximum number of sequences processed concurrently by `Engine`; additional requests wait in a queue).
+
+The `Engine` thread receives `Command::{Submit, Cancel, Shutdown}` messages over a `std::sync::mpsc` channel and sends generated events to a per-request `tokio::sync::mpsc::UnboundedSender`. The `axum` handler wraps the receiver into a Server-Sent Events (SSE) stream. If a client disconnects, the receiver is dropped, `send` returns an error, and `Engine` cancels the sequence and frees its KV and state allocations.
+
+| API | Endpoints | SSE Stream Format | Implementation Details |
+| :--- | :--- | :--- | :--- |
+| **OpenAI** | `POST /v1/chat/completions`<br/>`GET /v1/models` | `chat.completion.chunk` chunks, terminated by `data: [DONE]`; `usage` included when `stream_options.include_usage` is set | Reasoning mapped to `reasoning_content`; tool calls streamed in `tool_calls` with index and streaming `arguments`; `developer` role mapped to `system`; images passed via `image_url` (data URL), audio via `input_audio`. |
+| **Anthropic** | `POST /v1/messages`<br/>`POST /v1/messages/count_tokens` | `message_start` → `content_block_start/delta/stop` → `message_delta` → `message_stop`, plus `ping` | `system` passed as a top-level field, `max_tokens` required; reasoning emitted as `thinking_delta`, tool arguments as `input_json_delta`; stop reasons: `end_turn`, `max_tokens`, `stop_sequence`, `tool_use`; `budget_tokens` closes reasoning via a sampler hook; images passed as `base64` `image` blocks. |

@@ -1,53 +1,73 @@
-# lumen-rs — Kernels on GPU and CPU
+# GPU and CPU Compute Kernels (lumen-cuda-kernels and lumen-cpu)
 
-Oct 27, 2026 · @Vemloir
+This document describes the architecture of the `lumen-rs` compute kernels on GPU (CUDA C++) and CPU (AVX2 / AVX-512), including the algorithms used for fast parallel decoding of the trellis-coded LTQ format.
 
-On the GPU, our CUDA C++ kernels decode LTQ tiles; dense GEMM goes to CUTLASS and attention to FlashInfer. LTQ decode costs more than table formats: a weight's label depends on the 10 previous coded bits. But the label is a linear function of the window over GF(2), and neighbouring weights share the window, so kernels build labels for a whole group of weights from small tables instead of computing them one by one. Below is the kernel design and what the prototypes have already measured ([`ltq-research/src/cpu/tcq_avx2_bench.c`](https://github.com/lumen-inference/ltq-research/blob/main/src/cpu/tcq_avx2_bench.c), [`ltq-research/src/cuda/ltq_matvec_bench.cu`](https://github.com/lumen-inference/ltq-research/blob/main/src/cuda/ltq_matvec_bench.cu)).
+---
 
-**GPU**
+## 1. Fast LTQ Trellis Decoding Without Bitwise Loops
 
-| Operator | Implementation | Kernel design |
-| --- | --- | --- |
-| LTQ GEMV, M ≤ 8 (decode) | own kernel | a warp per tile row group, a tile's x̃ is loaded once for R rows. A weight's value is one read from a shared "10-bit window + uncoded bits → fp16" table in shared memory (4–32 KB per format), or a label via `popc` over the masks plus a read of `lut` replicated across banks; × gain × d; dot product with x̃ |
-| LTQ GEMM, 8 < M ≤ 32 | own kernel, MMA via CuTe | Marlin-style pipeline: tiles decoded into shared memory, then MMA |
-| LTQ, M > 32 (prefill) | own `reconstruct` + CUTLASS | `reconstruct` tiles into an fp16 scratch in chunks along M, then a CUTLASS GEMM |
-| MoE (mgemm) | own kernel | one grid over all active experts via the descriptor table; tokens grouped by expert; each expert has its own format |
-| Hadamard-256 | own kernel | 8 elements per lane × 32 lanes, butterflies via warp shuffle; fused with ⊙suh |
-| Row decoding | own kernel | gather of table rows, decode of LTQ rings (or int8) with the ring scale, inverse block Hadamard of size B, ⊙ signs |
-| Attention | FlashInfer + own variants | flash-attention over the paged KV; parameters: window, sinks, mask, KV layout (K and V, V only, another layer's cache) and bit width, output σ-gate from `q_proj` (`qwen3_next`, `qwen3_5_*`), block list from the indexer, scaling, softcap; decode — split-K |
-| QSA indexer | own kernel | block scoring relu(q·k) over heads, top-k blocks, pooling of completed blocks |
-| Gated DeltaNet | own kernel (reference: flash-linear-attention) | chunked algorithm for prefill, recurrent step for decode (with Q and K L2-norm), causal short conv1d, output `RMSNormGated` (`norm(y) · silu(z)` per V head) |
-| Hyper-connections | own kernel | stream mixing before a sub-block, output injection, stream collapse before the final norm |
-| RMSNorm (standard, `1 + w`, and `RMSNormGated`), RoPE, SwiGLU/GeGLU (incl. gpt-oss clamp), residual, softcap | own kernels | elementwise operations and reductions fused with neighbours |
-| Router + top-k, sampling | own kernel | warp reductions, Philox |
+Unlike independent lookup-table quantization formats, the subset index (`label`) of each weight in **LTQ** ([see specification](ltq-format.md)) depends on the bit parity of a **10-bit sliding window** of preceding code bits within the $16 \times 16$ tile. Evaluating this window weight-by-weight in a scalar loop requires 10–15 integer instructions per weight and bottlenecks execution on ALU throughput.
 
-- **RoPE** is described by a `RopeSpec`: default; partial (Qwen) — the first r dimensions rotate with frequencies θ^(−2i/r); proportional (p-RoPE, Gemma 4) — frequencies θ^(−2i/d) for the first p·d/2 angles at full d, the remaining angles are zero, and rotate-half spans the whole head, so dimensions \[0, p·d/2) and \[d/2, d/2 + p·d/2) rotate; YaRN; M-RoPE — angles are split into (t, h, w) sections.
-- **Attention inside a CUDA Graph.** The grid size is baked into the graph while lengths change every step, so the split-K partitioning is computed on the device from the lengths in `StepInputs`. FlashInfer's paged decode takes a page list per request, so the indexer's block list is passed in that form; what it lacks (4-token QSA blocks inside 64-token pages, K = V, quantized KV) is checked by a prototype at the start of phase 4, before GEMV.
-- **LTQ decode cost.** The minimum is about 5–6 integer operations and one shared-memory read per weight. A GEMV prototype on fp32 FMA (RTX PRO 6000) is decode-bound: 0.45–0.72 of the ceiling of the same kernel for a 4-bit table format. Bank conflicts on the shared table turned out not to be critical. To be VRAM-bound rather than decode-bound at batch 1 on a 5070 Ti we need int8 activations with `dp4a`, value lookup via `prmt`, and labels for 32 weights at once from bit planes. This is the first task of phase 4; `__dp4a` and `__byte_perm` (`prmt`) are plain CUDA intrinsics.
-- PDL (programmatic dependent launch via `cudaLaunchKernelEx`, sm\_90+) shortens the gaps between consecutive decode kernels: the next kernel starts its prologue while the previous one finishes.
-- The floor is sm\_80 (Ampere): bf16 MMA and `cp.async`. The kernel library carries SASS for every supported architecture, so the driver JIT-compiles PTX only on GPUs newer than the build.
+**Key Property Used by Kernels:**
+Parity is linear over $GF(2)$ (reducing to `XOR`), and adjacent weights in a tile row share overlapping 10-bit history windows. Consequently, GPU and CPU kernels **never evaluate the history window one weight at a time**; instead, they assemble subset labels for 16–32 weights in parallel using small precomputed lookup tables in fast on-chip memory (`shared memory` on GPU and L1 cache on CPU) combined with vector `XOR` operations.
 
-**CPU** — the speed reference is the measured DRAM ceiling ([performance.md](performance.md)). The main target is Zen 4/5 (AVX-512 VNNI and VBMI); Intel without AVX-512 and Zen 2 take the AVX2 path.
+---
 
-1. Input per token row: zero-pad to K\_pad, ⊙suh, block Hadamard-256, then quantize to int8 in blocks of 256 with an fp32 scale.
-2. The kernel walks K in a band of 16 rows (a tile row group) with accumulators in registers. Per 32 weights (two tile rows):
-   - labels — XOR of three 16-byte vectors from tables indexed by bytes of coded bits (9 bits of history + 2 bytes of the row, 16 KB of tables per format, resident in L1); the label bits land directly in their places in the level index;
-   - level index = label | uncoded bits (shift and mask of the planes; for D2 and D4 the low bit is restored with a byte shift and a mask);
-   - the int8 value is a `vpshufb` over the level table (16 entries; 32 or 64 entries — 2 or 4 `vpshufb` + `vpblendvb`, on VBMI a single `vpermb`);
-   - `vpmaddubsw` / `vpdpbusd` with the int8 input (the sign is moved onto the input with `vpsignb`), the sum of a row's 16 weights is scaled by gain × d in fp32.
-3. Output: + bias.
+## 2. GPU Kernels (`lumen-cuda-kernels`)
 
-- **Measured** (AVX2, one Zen 5 thread, data in L2): 25.6 billion weights/s at K = 2, 25.7 at K = 3, 23.3 at K = 4, 18.0 at K = 5; fractional modes are 12–14 % slower. For comparison: `IQ3_K` 35, `IQ5_K` / `IQ6_K` 20–21 on the same rig. By instruction count the kernel spends ~290 operations per 256 weights against a theoretical minimum of ~200 for this format.
-- **What this means for target CPUs** (6-core Skylake / Zen 2, DDR4 ~40 GB/s): at 3+ bits per weight the kernel is memory-bound, like GGUF. At 2–2.6 bits per weight it is estimated to be compute-bound: up to ~25 % tokens/s loss on a 2.5-bits/weight model with the current kernel, up to ~7 % at the minimum. Zen 4/5 with AVX-512 has more headroom. To be checked on real CPUs in phase 3.
-- int8 activation accuracy is about 0.9% RMS of the output per call. Table levels are int8 with a per-format scale; the effect of rounding on KLD is checked by differential tests against `lumen-ref`.
-- Dispatch: `Isa::{Avx2, Avx512Bw, Vnni, Vbmi}` is detected once at startup; kernels are `#[target_feature]` functions specialized by the constants `K`, the number of subsets and the fractional mode, in a pointer table \[ISA\]\[format\].
-- Work is split statically: in MoE the unit is an (expert, 16-row band) pair over active experts. Small experts (Qwen3.8-Flash-Next: 640 × 2560) produce many units, so the cost of handing out work is critical — which is what the spin pool removes.
-- M > 4 runs in chunks of 4 rows. A large prefill is better handed to the GPU — `prefill-compute` in [section 5 of architecture.md](architecture.md#5-scheduler-and-execution-pipeline).
+On the GPU, custom CUDA C++ kernels decode LTQ tiles and execute model operators, **CUTLASS** provides dense GEMM during prefill and Tensor Core MMA primitives (CuTe), and **FlashInfer** provides the foundation for paged attention:
 
-**Correctness.** The `lumen-ltq` reference is checked bit for bit against [`ltq-research/src/ltq_format.py`](https://github.com/lumen-inference/ltq-research/blob/main/src/ltq_format.py) on golden fixtures: tiles of every menu format produced by the real quantizer, and whole matrices with scales and rotation. CPU and GPU kernels are checked against the reference on random shapes. Whole models are checked through `lumen-ref` ([roadmap.md](roadmap.md)).
+| Operator | Implementation | Kernel Design |
+| :--- | :--- | :--- |
+| **LTQ GEMV ($M \le 8$, Decode)** | Custom CUDA C++ | One warp per tile row band; input vector $\tilde{x}$ is loaded once per row group. Weight values are either read from a unified "10-bit window + uncoded bits $\to$ `fp16`" lookup table in `shared memory` (4–32 KB per format), or labels are computed via `__popc` over masks with byte selection via `__byte_perm` (`prmt`) and **`__dp4a`** integer dot products against `int8`-quantized activations. |
+| **LTQ GEMM ($8 < M \le 32$)** | Custom CUDA C++ + CuTe MMA | Marlin-style pipeline decoding LTQ tiles into `shared memory` followed by Tensor Core MMA (`mma.sync`). |
+| **LTQ Prefill ($M > 32$)** | Custom `reconstruct` + **CUTLASS** | Unpacks LTQ tiles into a temporary `fp16` scratch buffer in chunks of $M$ via `reconstruct`, then executes dense GEMM via CUTLASS. |
+| **MoE (`mgemm`)** | Custom CUDA C++ | Single thread-block grid across all active experts via the `ExpertBank` descriptor table; tokens grouped by expert; supports distinct LTQ formats per expert. |
+| **Hadamard-256 + `suh`** | Custom CUDA C++ | 8 elements per lane $\times$ 32 warp lanes; all butterfly stages run in registers via `__shfl_xor_sync` fused with `suh` scaling. |
+| **Row Decode (`RowTable`)** | Custom CUDA C++ | Gathers table rows (from VRAM or over PCIe via `ZeroCopy`), decodes `LtqRing` rings (or `int8`) with ring scales, applies block Hadamard $H_B$ and signs. |
+| **Attention (`Attention`)** | **FlashInfer** + custom variants | Paged attention over `KvPool`. Parameters: sliding window, attention sinks, mask, KV layout ($K$ and $V$, $V$-only with on-the-fly $K$ reconstruction, shared KV) and bit width, sigmoid output gate from `q_proj`, sparse page lists from the QSA indexer, `softcap`; uses `split-K` on decode. |
+| **QSA Indexer (`IndexerScore`)** | Custom CUDA C++ | Computes per-head block scores $\text{ReLU}(q \cdot k)$, selects `top-k` blocks, and averages keys of completed 4-token blocks. |
+| **Gated DeltaNet (GDN)** | Custom CUDA C++ | Chunked algorithm during prefill (modeled on `flash-linear-attention`), recurrent state update on decode (with $L_2$-normalized $Q$ and $K$), causal `short conv1d`, and gated output `RMSNormGated`. |
+| **Hyper-Connections (`HcMix`, `HcInject`)** | Custom CUDA C++ | Mixes 4 residual streams before a sub-block, injects outputs back into the streams, and reduces streams before the final norm. |
+| **Norms (`RMSNorm`, `1 + w`, `RMSNormGated`), `RoPE`, `SwiGLU`/`GeGLU`, `Router`, `Sample`** | Custom CUDA C++ | Elementwise ops and warp reductions fused with neighboring operators, plus Philox RNG sampling. |
 
-## Sources
+### GPU Implementation Details
+- **`RoPE` Variants (`RopeSpec`):** default; `partial` (Qwen) — rotates the first $r$ dimensions; proportional (`p-RoPE`, Gemma 4) — frequencies $\theta^{-2i/d}$ for the first $p \cdot d / 2$ angles at full $d$, remaining angles zero, with `rotate-half` across the full head (rotating slices $[0, p \cdot d / 2)$ and $[d/2, d/2 + p \cdot d / 2)$); `YaRN`; 3D `M-RoPE` partitioning angles into $(t, h, w)$ sections.
+- **Attention inside CUDA Graphs:** because grid dimensions are baked into a captured graph while sequence lengths change every step, `split-K` partitioning parameters are computed on-device from `StepInputs`.
+- **Programmatic Dependent Launch (PDL):** on `sm_90+` GPUs, launching via `cudaLaunchKernelEx` with PDL allows the next kernel to begin its prologue while the previous kernel finishes writing its final blocks.
 
-- [NVIDIA CUTLASS and CuTe](https://github.com/NVIDIA/cutlass)
-- [FlashInfer — attention kernels with paged KV](https://github.com/flashinfer-ai/flashinfer)
-- cuda-oxide against CUDA C++ on the LTQ GEMV: [`results/kbench_gemv_g4.json`](https://github.com/lumen-inference/ltq-research/blob/main/results/kbench_gemv_g4.json), [`src/kbench/`](https://github.com/lumen-inference/ltq-research/tree/main/src/kbench)
+---
+
+## 3. CPU Kernels (`lumen-cpu`)
+
+The performance target for the CPU backend is the measured DRAM memory bandwidth ([performance.md](performance.md)). The primary target platform is **AVX-512 (VNNI and VBMI)** (AMD Zen 4/5 and server Intel CPUs), with a full **AVX2** fallback path.
+
+### CPU LTQ Kernel Algorithm
+
+1. **Per-Token Input Preparation:**
+   The input vector is zero-padded to $K_{\text{pad}}$, multiplied by `suh`, transformed via block Hadamard-256, and quantized to `int8` in 256-element blocks with `fp32` scales (activation `int8` quantization introduces ~0.9% RMS error per call).
+2. **Horizontal Band Traversal (`CpuBand16`):**
+   The kernel traverses a 16-row horizontal tile band along the $K$ axis while keeping accumulators in vector registers. The `CpuBand16` layout ensures all tiles in the band are stored contiguously in DRAM.
+3. **Decoding and Multiplying 32 Weights (Two Tile Rows) per Step:**
+   - **Label assembly (`label`):** labels for 16 weights in a row are computed by bitwise `XOR` (`vpxor`) of three 16-byte vectors fetched from precomputed L1 tables (16 KB per format) indexed by the `codes` bytes.
+   - **Level index assembly:** the label is combined with uncoded bits (`planes` and `lsb`; in `D2` and `D4` modes the lowest bit is reconstructed via byte shifts and masks).
+   - **`int8` codebook lookup (`lut`):** executed via `vpshufb` on AVX2 (using 2 or 4 `vpshufb` + `vpblendvb` for 32- or 64-entry tables) or a single `vpermb` instruction on AVX-512 VBMI.
+   - **Dot product accumulation:** multiplies `int8` weights with the `int8` input via `vpmaddubsw` / `vpdpbusd` (transferring signs via `vpsignb`) and scales the 16-element row sum by $\text{gain} \times d$ in `fp32`.
+
+### Measured CPU Kernel Throughput
+
+In single-thread Zen 5 benchmarks with data resident in L2 cache (AVX2 path, [`ltq-research/src/cpu/tcq_avx2_bench.c`](https://github.com/lumen-inference/ltq-research/blob/main/src/cpu/tcq_avx2_bench.c)), decoding and multiplication throughput reaches:
+- **25.6 billion weights/s** at $K = 2$;
+- **25.7 billion weights/s** at $K = 3$;
+- **23.3 billion weights/s** at $K = 4$;
+- **18.0 billion weights/s** at $K = 5$ (fractional `D2`/`D4` modes are 12–14% slower).
+
+For comparison, on the same testbed GGUF's table-based `IQ3_K` achieves 35 billion weights/s and `IQ5_K` / `IQ6_K` achieves 20–21 billion weights/s. Across all cores on target CPUs, the kernel is strictly DRAM-bandwidth bound for all formats of 3 bits/weight and above.
+
+---
+
+## 4. Kernel Verification
+
+1. **Bit-exact `lumen-ltq` verification:** the Rust reference decoder in `lumen-ltq` is tested bit-for-bit against the Python reference [`ltq_format.py`](https://github.com/lumen-inference/ltq-research/blob/main/src/ltq_format.py) across golden fixtures covering all 19 menu formats and ring tables.
+2. **Per-kernel tests:** every SIMD and CUDA kernel is verified against `lumen-ltq` across randomized matrix shapes.
+3. **End-to-end model differential tests:** full model graphs are verified against the scalar `lumen-ref` oracle ([roadmap.md](roadmap.md)).

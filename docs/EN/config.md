@@ -1,60 +1,161 @@
-# lumen-rs — Configuration and Placement Cascade
+# Configuration and Cascading Placement (lumen-config)
 
-Oct 27, 2026 · @Vemloir
+A configuration file in `lumen-rs` is a JSON document that defines:
+1. **The model and the placement of its components across hardware devices** (`model` section).
+2. **Runtime and backend parameters**: context length, KV cache quantization, CPU and disk thread pools, CUDA prefill chunking, and HTTP server settings.
 
-The config is JSON describing the model and its placement. At load time it is resolved once into a flat `PlacementPlan` ([section 2 of architecture.md](architecture.md#2-placement-plan)), after which nobody reads the JSON. Examples are in [`examples/`](../../examples/).
+At load time, the configuration is validated and resolved once into a flat `PlacementPlan` ([Section 3 of architecture.md](architecture.md#3-placement-plan-placementplan-and-data-access-modes)). Nothing reads the JSON file during generation.
 
-**Component names.** The tree comes from the architecture (`Architecture::components()`); typical names:
+Example configurations are located in [`examples/`](../../examples/):
+- [`examples/example-dense.json`](../../examples/example-dense.json) — 27B hybrid dense model (`Qwen3.8-27B`).
+- [`examples/example-moe.json`](../../examples/example-moe.json) — hybrid MoE model with n-gram table and sparse attention (`Qwen3.8-Flash-Next`).
 
+---
+
+## 1. Cascading Placement Principle
+
+A model contains dozens of layers, each with roughly ten internal sub-components (attention projections, cache, router, shared and routed experts, normalizations). To avoid listing device assignments for every tensor manually, the configuration uses **cascading inheritance**:
+
+1. At the top level of `"model"`, default placement parameters are defined for the entire model (for example, `"store": "vram:0"` and `"compute": "cuda:0"`).
+2. All child modules and layers inherit these defaults automatically.
+3. For large components that do not fit in VRAM (such as routed experts `moe/routed-experts` or the `ple/table` lookup table), `store` and `compute` are overridden on the corresponding subtree.
+4. To place specific layers on a different device, **layer range selectors** (such as `"32-47"`) are placed inside `"hidden-layers"`.
+
+### Inherited Placement Properties
+
+Any node in the model tree may specify three inherited keys:
+- **`"store"`** — permanent storage location (`"vram:0"`, `"ram:0"`, `"disk"`).
+- **`"compute"`** — compute device during token generation (`"cuda:0"`, `"cpu:0"`).
+- **`"prefill-compute"`** *(optional)* — compute device during prompt processing (prefill). For example, if a component specifies `"store": "ram:0"`, `"compute": "cpu:0"`, and `"prefill-compute": "cuda:0"`, it runs on the CPU during token decode, while during prefill its weights are streamed over PCIe into a VRAM ring buffer and computed on the GPU.
+
+---
+
+## 2. Model Component Tree
+
+Valid configuration paths are defined by the loaded model's `Architecture::components()` method. A typical component tree has the following structure:
+
+```text
+model
+├── input-layer/                  # Input token embedding table (embed)
+├── ple/                          # Per-Layer Embeddings (Gemma 4) or n-gram table (Qwen3.8)
+│   ├── table                     # Row lookup table ("store": "disk" or "ram:0")
+│   └── projections               # Per-layer PLE linear projections
+├── vision-tower/                 # Vision encoder (ViT)
+├── audio-tower/                  # Audio encoder (Conformer)
+├── hidden-layers/                # Repeating decoder layers (0 .. N-1)
+│   ├── norms/                    # Layer normalizations (input-norm, post-attention-norm, etc.)
+│   ├── attention/                # Full, Sliding, or Sparse Attention module
+│   │   ├── q, k, v, o            # Attention projection matrices (q includes output gate)
+│   │   ├── qk-norm, rope         # Q/K normalization and RoPE positional encoding
+│   │   ├── indexer/keys          # Indexer key cache (for QSA sparse attention)
+│   │   └── kv-cache              # Paged KV cache of the layer
+│   ├── linear-attention/         # Linear attention module (Gated DeltaNet / GDN)
+│   │   ├── projections/          # Projections (qkv, z, b, a, qkvz, ba, out)
+│   │   ├── conv, norm            # Short causal conv1d and gated output norm
+│   │   └── state                 # Layer recurrent state (StatePool)
+│   ├── hyper-connections/        # Multi-stream residual module (Hyper-Connections)
+│   ├── dense-mlp/                # Dense FFN block (gate, up, down)
+│   ├── moe/                      # Mixture-of-Experts module
+│   │   ├── router                # Expert router
+│   │   ├── shared-experts/       # Shared experts (gate, projections/...)
+│   │   └── routed-experts/       # Routed expert bank
+│   │       └── projections/      # Expert gate, up, down matrices
+│   └── "<layer-selector>"/       # Layer range override: e.g. "0-15" or "32-47"
+├── output-layer/                 # Final norm (norm) and output vocabulary head (lm-head)
+└── mtp/                          # Multi-Token Prediction module (subtree of the same shape)
 ```
-input-layer                        embed
-ple/                               table, projections  (Gemma 4 E2B/E4B; Qwen3.8-Flash-Next — the n-gram table)
-vision-tower, audio-tower          Qwen3.5 / 3.8, Gemma 4
-hidden-layers/
-  norms/                           input-norm, post-attention-norm, pre/post-feedforward-norm
-  attention/                       q (incl. output gate), k, v, o, qk-norm, rope, indexer/keys, kv-cache
-  linear-attention/                projections/{qkv,z,b,a,qkvz,ba,out}, conv, norm, state  (Gated DeltaNet)
-  hyper-connections/
-  dense-mlp/                       gate, up, down
-  moe/                             router, shared-experts/{gate,projections/…}, routed-experts/projections/{gate,up,down}
-output-layer/                      norm, lm-head
-mtp/                               a subtree of the same shape
-```
 
-**Cascade Resolution Rules**
+---
 
-1. Only `compute`, `store`, and `prefill-compute` are inherited; other keys (`kv-cache.*`) apply only within their own node.
-2. A node key is a property or a component name from the model's tree. Directly under `hidden-layers`, and only there, a layer selector is also allowed: comma-separated `N` and `N-M` ranges. A selector's value is a subtree of the same shape as `hidden-layers`: layer properties and components. A selector thus picks layers rather than components and works the same for models that interleave dense and MoE layers.
-3. The value for a (layer ℓ, component path) pair is first looked up in the selector matching ℓ: the deepest node along the path inside the selector where it is set. If the selector does not set it, the deepest node along the regular path under `hidden-layers` is used, then the ancestors. A selector beats a regular node at any depth.
-4. Two selectors matching the same layer is an error. Layer indices outside `[0, num_hidden_layers)` produce a warning; `--strict` turns it into an error.
-5. An unknown key is an error with a suggestion of the closest match (`stor` → `store`).
-6. Tree components that a particular model or layer lacks (`qk-norm` and `shared-experts` in gpt-oss, `moe` in dense layers) are skipped and annotated in `lumen inspect`; this way `dense-mlp` and `moe` under `hidden-layers` each apply to their own layers, and one config serves several models.
+## 3. Cascade and Layer-Selector Resolution Rules
 
-How this plays out for `routed-experts` in the MoE example (Qwen3.8-Flash-Next, 48 layers):
+1. **Inheritance:** only the `compute`, `store`, and `prefill-compute` keys are inherited down the tree.
+2. **Layer selectors:** directly inside `"hidden-layers"`, layer index selectors of the form `"N"` and `"N-M"` (including comma-separated ranges) are permitted. Each selector contains a subtree with the same structure as `"hidden-layers"`.
+3. **Precedence order:** the value for `(layer ℓ, component_path)` is resolved in the following order (from highest to lowest priority):
+   - **Priority 1 (layer selector):** the deepest matching node inside a layer selector matching layer $\ell$. A layer selector overrides the general `hidden-layers` subtree at any depth.
+   - **Priority 2 (general layer tree):** the deepest matching node directly under `hidden-layers`.
+   - **Priority 3 (model root):** default values at the root of `"model"`.
+4. **Validation:**
+   - Two selectors overlapping on the same layer index produce a load error.
+   - Layer indices outside `[0, num_hidden_layers)` produce a warning (or an error with `--strict`).
+   - An unknown key produces an error suggesting the closest valid name (e.g., `"stor"` → `"store"`).
+   - Valid tree components absent from a specific model or layer (e.g., `moe` in dense layers or `shared-experts` in `gpt-oss`) are ignored and noted in `lumen inspect`.
 
-| Layer | compute / store of projections | Source of the value |
-| --- | --- | --- |
-| 0 | cpu:0 / ram:0 | `hidden-layers → moe → routed-experts` |
-| 32 | cuda:0 / vram:0 | `hidden-layers → "32-47" → moe → routed-experts`; the selector overrode the regular node |
-
-A selector can also cover a whole layer: `"45-47": { "compute": "cuda:0", "store": "vram:0" }` moves layers 45–47 to the GPU entirely, including nodes the regular tree sets deeper. Selectors are written for a specific model's layer count: on a model with fewer layers, the extra indices produce warnings.
-
-**The `model` section holds only the model and its placement:** the path, the component cascade, and `sampling`. Everything unrelated to placement lives at the top level of the config, next to `model`:
+### Resolution Example (`examples/example-moe.json`, 48 layers)
 
 ```json
-"chat-template": { "kwargs": { "enable_thinking": true } },
-"context": { "size": 8192 },
-"kv-quantization": { "k-bits": 8, "v-bits": 5 },
-"attention-mechanism": "flash-attention"
+"model": {
+  "path": "models/qwen3.8-flash-next/model.ltq",
+  "compute": "cuda:0",
+  "store": "vram:0",
+  "hidden-layers": {
+    "moe": {
+      "routed-experts": {
+        "compute": "cpu:0", "store": "ram:0", "prefill-compute": "cuda:0"
+      }
+    },
+    "32-47": {
+      "moe": {
+        "routed-experts": {
+          "compute": "cuda:0", "store": "vram:0"
+        }
+      }
+    }
+  }
+}
 ```
 
-- `chat-template` — the chat template and its kwargs ([api.md](api.md)).
-- `context.size` — the maximum sequence length in tokens; the KV pool and states are allocated from it.
-- `kv-quantization` — the bit width of K and V (`k-bits`, `v-bits`: 2–8 each); if omitted, KV is in bf16 ([section 3 of architecture.md](architecture.md#3-memory-storage-locations-and-access-modes)).
-- `attention-mechanism` — the attention implementation; if omitted, `flash-attention` is used. The sliding-layer window and other attention parameters come from the model config.
+| Layer | Component | Resolved `compute` / `store` | Rule Source |
+| :---: | :--- | :---: | :--- |
+| `0..47` | `attention`, `linear-attention`, `moe/router`, `moe/shared-experts` | `cuda:0` / `vram:0` | `"model"` root |
+| `0..31` | `moe/routed-experts` | `cpu:0` / `ram:0` (`prefill`: `cuda:0`) | `hidden-layers → moe → routed-experts` |
+| `32..47` | `moe/routed-experts` | `cuda:0` / `vram:0` | `hidden-layers → "32-47" → moe → routed-experts` |
 
-The context size, KV quantization, and the attention implementation are properties of the sequence and are the same for every layer.
+---
 
-The `cpu`, `cuda`, and `disk` sections are backend properties, not cascade nodes: `threads`, `reserve-cores`, `numa-spread`, `prefill-chunk-size`, `io-threads`, and `mlock` are described in [sections 3 and 5 of architecture.md](architecture.md#3-memory-storage-locations-and-access-modes); `cuda.cuda-graphs: false` turns off CUDA Graphs ([section 5 of architecture.md](architecture.md#5-scheduler-and-execution-pipeline)) for debugging and profiling. The `server` section is described in [api.md](api.md).
+## 4. Top-Level Sections and Backend Settings
 
-**Implementation order.** Phase 1 only needs a flat plan — one place per component, no selectors. The selector grammar and the cascade arrive once the first model runs on the CPU.
+Outside the `"model"` object, top-level sections configure sequence, backend, and server parameters:
+
+```json
+{
+  "chat-template": {
+    "kwargs": { "enable_thinking": true }
+  },
+  "context": {
+    "size": 262144
+  },
+  "kv-quantization": {
+    "k-bits": 8,
+    "v-bits": 5
+  },
+  "cuda": {
+    "prefill-chunk-size": 4096,
+    "cuda-graphs": true
+  },
+  "cpu": {
+    "threads": 16,
+    "reserve-cores": 1,
+    "numa-spread": false
+  },
+  "disk": {
+    "io-threads": 4,
+    "mlock": false
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "max-concurrent-requests": 1
+  },
+  "attention-mechanism": "flash-attention"
+}
+```
+
+- **`chat-template.kwargs`** — default variables passed to the model's Jinja chat template ([api.md](api.md)).
+- **`context.size`** — maximum sequence context length in tokens, determining KV and state pool allocations.
+- **`kv-quantization`** — bit widths for keys (`k-bits`) and values (`v-bits`) from 2 to 8 bits; if omitted, the KV cache is stored in `bf16`.
+- **`attention-mechanism`** — attention implementation to use (defaults to `"flash-attention"`).
+- **`cuda`** — prompt chunk size `prefill-chunk-size` and `cuda-graphs` toggle (defaults to `true`; disabling is useful during profiling).
+- **`cpu`** — spin-pool worker count `threads` (`0` = all physical cores on the node minus `reserve-cores`, which defaults to 1) and multi-socket `numa-spread` toggle.
+- **`disk`** — disk I/O worker count `io-threads` and `mlock` toggle to pin disk tables in RAM when memory permits.
+- **`server`** — bind host, port, and `max-concurrent-requests` limit for `lumen serve`.

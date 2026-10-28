@@ -1,2 +1,5 @@
 target/
 experements/
+models/
+.vscode/
+.claude/

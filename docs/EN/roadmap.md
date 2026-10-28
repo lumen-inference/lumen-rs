@@ -1,32 +1,47 @@
-# lumen-rs — Implementation Order and Risks
+# Implementation Roadmap and Risk Management
 
-Oct 27, 2026 · @Vemloir
+The implementation of `lumen-rs` is structured into **10 sequential phases**: first building the placement plan, reference decoders, and a complete end-to-end CPU pipeline, and then layering CUDA kernels and hybrid offloading on top. Each phase is verified against the preceding one.
 
-Placement plan and references first, then the full CPU path, then CUDA and offloading; each step is verified by the previous one.
+---
 
-1. `core`, `mem`, `config` with a flat plan, and `lumen inspect` — the plan is printed before the first kernel exists. A `lumen-ref` skeleton. The architecture checks in CI from [section 8 of architecture.md](architecture.md#8-extensibility) — from the first commit.
-2. `format` and the `lumen-ltq` reference decoder with golden fixtures from the prototype. The LTQ format was chosen and fixed empirically ([ltq-design.md](ltq-design.md), [specification](ltq-format.md)); until `lumen-quantize` exists, LTQ models come from the Python quantizer prototype. In parallel — porting the quantizer: the Viterbi and LDLQ CUDA kernels move from the prototype ([`ltq-research/src/cuda/tcq_viterbi.cu`](https://github.com/lumen-inference/ltq-research/blob/main/src/cuda/tcq_viterbi.cu)) into `lumen-cuda-kernels`, the LDLQ loop, profile and DP into Rust; checked against the prototype by KLD.
-3. CPU: LTQ GEMV, hybrid and dense layers → `lumen run` fully on the CPU for Llama, Qwen3, and `qwen3_5_dense`. Differential tests through `lumen-ref`: logits against transformers on tiny models (random fixtures such as `tiny-random-*` and `qwen4_exp_tiny_fixture`) and placement invariance — any valid `PlacementPlan` yields the same logits within tolerance.
-4. CUDA: first attention on FlashInfer over the paged KV with our variants (QSA block lists, K = V, quantized KV) and `GatedDeltaNet`, then LTQ GEMV at the VRAM ceiling and CUDA Graphs → a config fully on the GPU.
-5. Offload core: expert banks, `Transfer`, the flag protocol, the spin pool; `qwen3_next`, `qwen3_5_moe`, gpt-oss, and Qwen3-MoE with experts on the CPU; `lumen probe`, `Program::floor`, and a first η measurement on the rig.
-6. Disk: `RowTable`, `Fetch`, the I/O pool, prefetching.
-7. Prefill: reconstruct + CUTLASS GEMM, chunking, `prefill-compute` with the CPU layout in 16-row bands, dead rows. The backward pass of the supported blocks for Fisher in `lumen-quantize` — once the forward pass is stable.
-8. Architecture extensions: Qwen3.8-Flash-Next (QSA, hyper-connections, n-gram PLE on top of `qwen3_next`/`qwen3_5_moe`) and Gemma 4 (K = V, p-RoPE, shared KV, PLE, dense MLP in parallel with MoE); the target on the rig is η ≥ 0.85 of the critical-path ceiling (about 58 tok/s by spec at a 262k context).
-9. Batching, prefix cache, GPU sampling, the asynchronous step, speculative decoding (`NGram`, `Mtp`, `Gemma4Assistant`); then the server with OpenAI and Anthropic APIs.
-10. Multimodality: `lumen-media`, encoders (`qwen3_5_*`, `qwen4_exp`, Gemma 4), the encoder-free embedder of Gemma 4 12B, span masks.
+## Phased Implementation Order
+
+1. **Phase 1 — Core Types, Config Parser, and `lumen inspect`:**
+   Implement `lumen-core`, `lumen-mem`, and `lumen-config` with flat `PlacementPlan` resolution and the `lumen inspect` command (printing the resolved placement plan before writing the first compute kernel). Build the `lumen-ref` reference executor skeleton. Enable CI architectural boundary checks ([Section 9 of architecture.md](architecture.md#9-extensibility-rules-and-architectural-boundaries)) from the first commit.
+2. **Phase 2 — `.ltq` Container, `lumen-ltq` Reference Decoder, and Quantizer Port:**
+   Implement container loading in `lumen-format` and tensor descriptors in `lumen-tensor`. Implement the `lumen-ltq` reference decoder and verify it bit-for-bit against golden fixtures from the Python prototype (`ltq-research`). In parallel, port the CUDA Viterbi and Block16-LDLQ kernels into `lumen-cuda-kernels` and implement the LDLQ loop, slice profiling, and DP allocation in Rust (`lumen-quantize`), verifying KLD parity.
+3. **Phase 3 — End-to-End CPU Pipeline (`lumen-ref` and `lumen-cpu`):**
+   Implement `LTQ GEMV` kernels, dense and hybrid modules in `lumen-models`, and the `lumen-exec` compiler. Run `lumen run` end-to-end on CPU for `Llama`, `Qwen3`, and `qwen3_5_dense`. Run differential tests via `lumen-ref`: verify logits against `transformers` on tiny random fixtures and verify logit invariance across valid `PlacementPlan` configurations.
+4. **Phase 4 — Pure GPU Pipeline (`lumen-cuda` and `lumen-cuda-kernels`):**
+   Wire up `nvcc` kernel compilation and `lumen-kabi` (`cbindgen`). Integrate paged attention on **FlashInfer** with custom variants (QSA block lists, $K = V$ reconstruction, quantized KV cache) and the `GatedDeltaNet` kernel, followed by VRAM-ceiling `LTQ GEMV` kernels and **CUDA Graphs**.
+5. **Phase 5 — Hybrid GPU ↔ CPU Offload Core and $\eta$ Benchmarking:**
+   Implement `ExpertBank`, the `Transfer` operator, the `pinned RAM` flag protocol, and the CPU spin pool. Run `qwen3_next`, `qwen3_5_moe`, `gpt-oss`, and `Qwen3-MoE` with experts offloaded to CPU. Implement `lumen probe`, `Program::floor`, and `lumen bench`.
+6. **Phase 6 — NVMe Disk Offload (`RowTable` and `Fetch`):**
+   Implement `RowTable` ring decoding, the background I/O thread pool (`io_uring` / `pread`), and ahead-of-time `Fetch` prefetching.
+7. **Phase 7 — Fast Prefill and Weight Streaming (`prefill-compute`):**
+   Implement the `reconstruct + CUTLASS GEMM` path, prompt chunking, `"prefill-compute": "cuda:0"` weight streaming reading the `CpuBand16` layout, and dead-row elimination. Add backward passes for supported blocks to compute Fisher information natively in `lumen-quantize`.
+8. **Phase 8 — Specialized Architecture Modules (`Qwen3.8-Flash-Next` and `Gemma 4`):**
+   Add `QSA`, `Hyper-Connections`, and n-gram `PLE` for `Qwen3.8-Flash-Next`, plus $K = V$, `p-RoPE`, shared KV, `PLE`, and parallel Dense MLP + MoE for `Gemma 4`. Reach the target $\eta \ge 0.85$ of the critical-path ceiling on the reference rig (~58 tokens/s at 262k context).
+9. **Phase 9 — Server Runtime, Batching, and Speculative Decoding:**
+   Implement continuous batching, `PrefixCache` with recurrent state snapshots, GPU sampling, asynchronous step pipelining, speculative drafters (`NGram`, `DraftModel`, `Mtp`, `Gemma4Assistant`), and `lumen-server` (OpenAI and Anthropic APIs).
+10. **Phase 10 — Multimodality (`lumen-media`):**
+    Implement media preprocessing in `lumen-media`, vision (ViT) and audio (Conformer) encoders, the encoder-free `Gemma 4 12B` patch embedder, and bidirectional image span masks.
+
+---
+
+## Technical Risks and Mitigations
 
 | Risk | Impact | Mitigation |
-| --- | --- | --- |
-| The Rust ↔ CUDA C++ boundary | parameter layout drift between the two languages; mistakes the Rust compiler does not see | `lumen-kabi` as the only boundary, a header generated by cbindgen, launch tests for every kernel, compute-sanitizer in CI |
-| LTQ decode on the GPU costs more than table formats (prototype: 0.45–0.72 of a 4-bit table format) | GEMV at batch 1 is decode-bound rather than VRAM-bound | int8 + `dp4a`, lookup via `prmt`, a shared table in shared memory; measured against the VRAM ceiling at the start of phase 4 |
-| CPU decode of LTQ at 2–2.6 bits per weight | compute-bound on 6-core Skylake / Zen 2: up to ~25 % tokens/s with the current kernel | labels via table XOR, the VBMI path; DP can avoid the lowest formats for CPU experts |
-| Fisher needs a backward pass | without Fisher weights DP is twice as bad | backward pass of the supported blocks in `lumen-quantize`; until then, Fisher from the Python prototype |
-| Sensitivity measured on calibration data does not transfer to other data | a "bold" bit allocation is worse on other languages (up to +55 % KLD) | diverse calibration (languages, agents, long context), a smoothed DP profile |
-| Build time and size of the CUDA kernels (FlashInfer and CUTLASS templates, specializations per format and architecture) | slow builds, a large binary | instantiate only the needed variants, split `.cu` files, sccache; SASS only for supported architectures |
-| FlashInfer does not cover our attention variants (4-token QSA blocks, K = V, quantized KV, σ-gate) | attention needs our own kernel | a prototype at the start of phase 4; FlashInfer's variant mechanism or a fork; fallback — our own flash-decoding kernel |
-| Capturing flag waits into a CUDA Graph | without it — per-segment graphs and more launches | the consumer-resets-the-flag protocol; verify at the start of phase 5 on the target driver |
-| Disk latency (page-cache eviction, cold NVMe) | spikes in per-token time | prefetching by known addresses, an I/O pool outside the hot loop, `disk.mlock` when RAM allows |
-| Rolling back recurrent state and snapshotting it | complexity of speculative decoding and prefix cache for hybrid models | history in the slot, as in exllamav3; snapshots only at turn boundaries |
-| Experimental architectures change (`qwen4_exp`) | rework once the final version ships | quirks as operator parameters; parity tests on tiny fixtures |
-| Cost of handing out CPU work at every layer | extra microseconds × 90 transitions per token | a spin pool with static partitioning; η of crossings from `--trace` |
-| Architecture erosion as the engine grows | special cases spread through the scheduler, backends and kernels; each new model costs more than the last | the rules of [section 8 of architecture.md](architecture.md#8-extensibility) as CI checks from the first phase; a new `Op` variant only with a reference implementation and a reason why parameters cannot express it |
+| :--- | :--- | :--- |
+| **Type layout mismatch across the Rust ↔ CUDA C++ boundary** | Struct field mismatches invisible to the Rust compiler | `lumen-kabi` as the sole boundary, `lumen_kabi.h` generated by `cbindgen`, per-kernel launch tests under `compute-sanitizer` in CI. |
+| **GPU LTQ decode overhead at batch = 1** | GEMV kernel bottlenecks on bit decoding rather than VRAM bandwidth | Use `int8` activations with `__dp4a`, byte selection via `__byte_perm` (`prmt`), and unified lookup tables in `shared memory`; benchmark against VRAM ceiling at the start of Phase 4. |
+| **CPU LTQ decode compute load at 2–2.6 bpw** | CPUs without AVX-512 (6-core Skylake / Zen 2) may become compute-bound on the lowest formats | Assemble labels via table `XOR`, use AVX-512 VBMI on Zen 4/5, and optionally restrict the minimum format assigned to CPU experts in DP. |
+| **Fisher bit allocation requires a backward pass** | Without Fisher weights, DP bit allocation quality drops by half | Import Fisher profiles from the Python prototype until native block backward passes are added to `lumen-quantize`. |
+| **Calibration sensitivity overfitting to domain** | Aggressively assigning 2 bits to cold experts degrades multilingual KLD | Use diverse multilingual calibration traces and smooth the DP sensitivity profile. |
+| **CUDA kernel compile time and binary size** | Long builds from FlashInfer / CUTLASS templates and format specializations | Split template instantiations across separate `.cu` files for parallel compilation, cache with `sccache`, and emit SASS only for target architectures. |
+| **Standard FlashInfer template limitations** | Need to support 4-token QSA blocks, $K = V$, quantized KV, and sigmoid output gating | Prototype custom FlashInfer variants at the start of Phase 4; fallback is a custom `flash-decoding` kernel. |
+| **Capturing flag waits inside a CUDA Graph** | Inability to capture flag waits would require splitting the step into per-segment graphs | Consumer-reset flag protocol (`WaitValue32` always waits for constant `1`); verify on target driver at the start of Phase 5. |
+| **NVMe disk read latency spikes** | OS page-cache misses or cold NVMe reads causing token latency spikes | Ahead-of-time `Fetch` using known token IDs, dedicated background I/O pool, and `disk.mlock` when sufficient RAM is available. |
+| **Recurrent state rollback complexity** | `GatedDeltaNet` state matrices cannot be rolled back by simply decrementing sequence length | Store a $k$-step state history window in `StatePool` and record `PrefixCache` snapshots only at chat turn boundaries. |
+| **CPU work dispatch overhead on every layer** | Extra microseconds $\times$ 90 crossings per token | User-space spin pool with static partitioning of `(expert, 16-row band)` pairs; monitor crossing $\eta$ via `--trace`. |
+| **Architectural boundary erosion as the codebase grows** | Model-specific branches leaking into the scheduler and backends | Automated CI checks from Phase 1 ([Section 9 of architecture.md](architecture.md#9-extensibility-rules-and-architectural-boundaries)). |

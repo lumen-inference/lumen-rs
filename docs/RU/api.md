@@ -1,34 +1,58 @@
-# lumen-rs — чат-слой, CLI и сервер
+# Внешние интерфейсы: чат-слой, CLI и HTTP-сервер
 
-Oct 27, 2026 · @Vemloir
+Внешний интерфейс движка поверх [`Engine`](architecture.md#8-рантайм-генерации-engine-спекулятивка-и-мультимодальность) разделён на три крейта:
+- **`lumen-chat`** — форматирование диалоговых сообщений (текст, изображения, аудио, системные промпты и определения инструментов) в токены и потоковый разбор сгенерированных токенов в типизированные события.
+- **`lumen-cli`** — бинарный файл `lumen` для запуска генерации, инспекции планов размещения, микробенчмарков оборудования и квантования моделей.
+- **`lumen-server`** — HTTP-сервер на базе `axum`, совместимый с протоколами **OpenAI API** и **Anthropic Messages API**.
 
-Внешний интерфейс движка поверх `Engine` ([раздел 6 architecture.md](architecture.md#6-рантайм-ядро-генерации-и-спекулятивка)): чат-слой (`lumen-chat`), бинарь `lumen` и HTTP-сервер (`lumen-server`).
+---
 
-**Чат-слой** (`lumen-chat`)
+## 1. Чат-слой и парсинг вывода (`lumen-chat`)
 
-- Токенизатор — `tokenizers`; он и шаблон берутся из заголовка `.ltq` (`tokenizer`, `chat_template`). Шаблон — через minijinja с `minijinja-contrib` (pycompat для Python-методов строк в HF-шаблонах), плюс `raise_exception` и `strftime_now`.
-- kwargs шаблона: `chat-template.kwargs` из конфига, поверх — параметры запроса (`reasoning_effort` из OpenAI, `thinking` из Anthropic).
-- Мультимодальные части сообщений (картинки, аудио, видео) проходят через `lumen-media`; шаблон вставляет столько токенов-заполнителей, сколько вернул препроцессор.
-- Парсер вывода на семейство: Harmony у gpt-oss через `openai-harmony` (каналы analysis, commentary, final; вызовы `to=functions.*`), `<think>` и `<tool_call>` у Qwen. Работает по id спецтокенов, а не по тексту.
-- Инкрементальная детокенизация со смещениями prefix и read: незаконченный UTF-8 не уходит наружу.
+Все метаданные для подготовки промпта хранятся непосредственно в заголовке файла `.ltq` ([см. спецификацию контейнера](ltq-format.md#6-срезы-строк-и-контейнер-ltq)): словарь токенизатора (`tokenizer`), шаблон чата (`chat_template`) и конфигурация препроцессора медиафайлов (`processor_config`).
 
-**CLI** (`lumen`)
+1. **Токенизация и рендеринг шаблонов:**
+   Токенизация выполняется крейтом `tokenizers`. Шаблон чата рендерится через `minijinja` с подключённым `minijinja-contrib` (`pycompat` для поддержки методов строк Python в шаблонах HuggingFace), а также функциями `raise_exception` и `strftime_now`.
+2. **Параметры шаблона (`kwargs`):**
+   Базовые значения берутся из секции `chat-template.kwargs` конфигурационного файла и дополняются параметрами конкретного запроса (`reasoning_effort` из OpenAI API или `thinking` из Anthropic API).
+3. **Мультимодальные сообщения:**
+   Изображения, видео и аудио проходят препроцессинг в `lumen-media`; шаблон подставляет в поток соответствующее число токенов-заполнителей.
+4. **Инкрементальная детокенизация и парсинг спецблоков:**
+   - Детокенизатор отслеживает смещения префикса и чтения, удерживая незавершённые последовательности байтов UTF-8 до прихода следующего токена.
+   - Выделение рассуждений (`reasoning`) и вызовов инструментов (`tool calls`) работает по **ID специальных токенов**, а не по текстовому поиску: для моделей `gpt-oss` используется парсер `openai-harmony` (каналы `analysis`, `commentary`, `final` и вызовы `to=functions.*`), для моделей семейства Qwen — спецтокены `<think>` и `<tool_call>`.
 
-- `run -c cfg.json -p "…"` и `chat`: цикл `Engine::step` в главном потоке, `stdout().lock()` и flush после каждого токена.
-- `serve`: сервер из секции `server`.
-- `inspect`: разрешённый план по слоям с источником каждого значения; память по устройствам и классам (веса, KV на токен, состояние на последовательность); байты по ресурсам на токен и оба потолка шага ([performance.md](performance.md)).
-- `probe`: замер потолков железа → `hw-profile.json`.
-- `bench`: pp и tg в токенах в секунду и η — по шагу, по ресурсам и по сегментам; `--trace` пишет временную шкалу сегментов в формате Chrome trace.
-- `pack`: запись модели в итоговых укладках ([раздел 4 architecture.md](architecture.md#4-веса-дескрипторы-и-загрузка)).
-- Спекулятивка: `--draft cfg.json`, `--spec-k 4`, `--ngram`, `--mtp`.
+На выходе `lumen-chat` формирует унифицированный поток событий `ChatEvent`:
+- `ReasoningDelta(String)`
+- `TextDelta(String)`
+- `ToolCallStart`, `ToolArgsDelta`, `ToolCallEnd`
+- `Done { reason, usage }`
 
-**Сервер** (`lumen-server`)
+---
 
-Секция `server` конфига задаёт `host`, `port` и `max-concurrent-requests` — сколько последовательностей движок ведёт одновременно; остальные ждут в очереди. Поток движка принимает `Command::{Submit, Cancel, Shutdown}` через `std::sync::mpsc`, а события отдаёт в `tokio::sync::mpsc::UnboundedSender` запроса — отправка из обычного потока безопасна. Хендлер axum превращает приёмник в SSE. Клиент отключился → приёмник уничтожен → `send` возвращает ошибку → движок отменяет последовательность и освобождает KV.
+## 2. Интерфейс командной строки (`lumen-cli`)
 
-Оба API — адаптеры над одной внутренней моделью: на входе `ChatRequest`, на выходе поток `ChatEvent` (`ReasoningDelta`, `TextDelta`, `ToolCallStart`, `ToolArgsDelta`, `ToolCallEnd`, `Done`).
+| Команда | Назначение |
+| :--- | :--- |
+| **`lumen run`** | Одиночная генерация по промпту (`lumen run -c cfg.json -p "…"`). Цикл `Engine::step()` выполняется синхронно в главном потоке со сбросом буфера `stdout` после каждого токена. |
+| **`lumen chat`** | Интерактивный многоходовый чат в терминале с сохранением префикса KV-кэша между репликами. |
+| **`lumen serve`** | Запуск HTTP-сервера с параметрами из секции `server` конфигурации. |
+| **`lumen inspect`** | Печать разрешённого `PlacementPlan` по слоям с указанием источника каждого значения в JSON, расхода памяти по устройствам и классам (веса, KV на токен, состояние на последовательность), объёма пересылок по ресурсам и обоих физических потолков шага ([performance.md](performance.md)). |
+| **`lumen probe`** | Измерение пропускной способности и задержек оборудования с сохранением профиля в `hw-profile.json`. |
+| **`lumen bench`** | Замер скорости обработки промпта (`pp`) и генерации (`tg`) в токенах в секунду, а также расчёт КПД $\eta$ по шагу, ресурсам и сегментам; флаг `--trace` записывает временную шкалу в формате Chrome Trace. |
+| **`lumen pack`** | Перепаковка весов модели `.ltq` в целевые укладки бэкендов (`CpuBand16` / `GpuWarp`) на диске ([раздел 6 architecture.md](architecture.md#6-представление-весов-и-загрузка-модели)). |
+| **`lumen quantize`** | Квантование исходного чекпойнта BF16 (`safetensors`) в контейнер `.ltq`. |
 
-| API | Эндпоинты | Поток | Особенности |
-| --- | --- | --- | --- |
-| OpenAI | `POST /v1/chat/completions`, `GET /v1/models` | SSE `chat.completion.chunk`, финал `data: [DONE]`; usage при `stream_options.include_usage` | reasoning → `reasoning_content`; `tool_calls` с index и потоковыми `arguments`; роль `developer` = system; картинки — части `image_url` (data URL), аудио — `input_audio` |
-| Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` | `message_start` → `content_block_start/delta/stop` → `message_delta` → `message_stop`, плюс `ping` | `system` отдельным полем, `max_tokens` обязателен; `thinking_delta`, `input_json_delta`; stop\_reason: end\_turn, max\_tokens, stop\_sequence, tool\_use; `budget_tokens` закрывает reasoning принудительно через хук сэмплера; картинки — блоки `image` с base64 |
+Флаги спекулятивного декодирования: `--draft cfg.json`, `--spec-k 4`, `--ngram`, `--mtp`.
+
+---
+
+## 3. HTTP-сервер (`lumen-server`)
+
+Секция `server` конфигурации задаёт `host`, `port` и `max-concurrent-requests` (максимальное число последовательностей, которые `Engine` обрабатывает одновременно; остальные запросы ожидают в очереди).
+
+Поток `Engine` принимает команды `Command::{Submit, Cancel, Shutdown}` через `std::sync::mpsc`, а сгенерированные события отправляет в `tokio::sync::mpsc::UnboundedSender`, созданный под конкретный HTTP-запрос. Обработчик `axum` преобразует этот канал в поток Server-Sent Events (SSE). При отключении клиента приёмник канала уничтожается, вызов `send` возвращает ошибку, и `Engine` автоматически отменяет генерацию последовательности, освобождая занятые блоки KV-кэша и состояния.
+
+| API | Эндпоинты | Формат потока SSE | Особенности реализации |
+| :--- | :--- | :--- | :--- |
+| **OpenAI** | `POST /v1/chat/completions`<br/>`GET /v1/models` | Чанки `chat.completion.chunk`, финал `data: [DONE]`; статистика `usage` при `stream_options.include_usage` | Рассуждения передаются в `reasoning_content`; вызовы инструментов — в `tool_calls` с индексом и потоковыми `arguments`; роль `developer` мапится в `system`; изображения передаются через `image_url` (data URL), аудио — через `input_audio`. |
+| **Anthropic** | `POST /v1/messages`<br/>`POST /v1/messages/count_tokens` | События `message_start` → `content_block_start/delta/stop` → `message_delta` → `message_stop`, плюс `ping` | Поле `system` передаётся отдельно, `max_tokens` обязателен; рассуждения — `thinking_delta`, аргументы инструментов — `input_json_delta`; причины остановки: `end_turn`, `max_tokens`, `stop_sequence`, `tool_use`; лимит `budget_tokens` принудительно закрывает блок рассуждений через хук сэмплера; изображения передаются блоками `image` с `base64`. |
