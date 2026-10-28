@@ -8,3 +8,7 @@ rust-version.workspace = true
 [dependencies]
 lumen-core.workspace = true
 lumen-tensor.workspace = true
+lumen-ltq.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+memmap2.workspace = true

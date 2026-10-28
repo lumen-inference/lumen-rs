@@ -29,6 +29,14 @@ lumen-quantize = { path = "crates/lumen-quantize" }
 lumen-server = { path = "crates/lumen-server" }
 lumen-cli = { path = "crates/lumen-cli" }
 
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+half = { version = "2.4", features = ["bytemuck", "serde"] }
+bytemuck = { version = "1.18", features = ["derive"] }
+memmap2 = "0.9"
+clap = { version = "4.5", features = ["derive"] }
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
