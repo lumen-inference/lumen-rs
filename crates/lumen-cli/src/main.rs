@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use lumen_config::RuntimeConfig;
+use lumen_format::LtqContainer;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -25,14 +26,6 @@ enum Commands {
         /// Path to the JSON configuration file (e.g., examples/example-moe.json).
         #[arg(short, long)]
         config: PathBuf,
-
-        /// Optional architecture preset override (dense, moe, qwen3_next, qwen4_exp, gemma4).
-        #[arg(long)]
-        preset: Option<String>,
-
-        /// Optional number of hidden layers override when inspecting without a .ltq model file.
-        #[arg(long)]
-        layers: Option<usize>,
 
         /// Treat out-of-range layer selectors as hard errors instead of warnings.
         #[arg(long)]
@@ -103,14 +96,10 @@ fn main() -> ExitCode {
 
 fn run_cmd(cmd: Commands) -> lumen_core::Result<()> {
     match cmd {
-        Commands::Inspect {
-            config,
-            preset,
-            layers,
-            strict,
-        } => {
+        Commands::Inspect { config, strict } => {
             let cfg = RuntimeConfig::from_file(&config)?;
-            let tree = cfg.infer_tree_for_inspect(preset.as_deref(), layers)?;
+            let container = LtqContainer::open(&cfg.model_path)?;
+            let tree = container.header.component_tree()?;
             let plan = cfg.resolve_plan(tree, strict)?;
             print!("{}", plan.format_inspect(&cfg));
             Ok(())

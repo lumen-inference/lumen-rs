@@ -12,7 +12,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use lumen_core::{DType, LumenError, Result, Shape};
+use lumen_core::{ComponentTree, DType, LumenError, Result, Shape};
 use lumen_ltq::LtqFormat;
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,36 @@ impl LtqHeader {
         Ok(())
     }
 
+    /// Builds the `ComponentTree` for this `.ltq` model from its embedded `config` metadata.
+    pub fn component_tree(&self) -> Result<ComponentTree> {
+        let cfg = self
+            .config
+            .get("text_config")
+            .unwrap_or(&self.config);
+        let model_type = cfg
+            .get("model_type")
+            .or_else(|| self.config.get("model_type"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LumenError::Format("missing 'model_type' in .ltq header config".to_string())
+            })?;
+        let num_layers = cfg
+            .get("num_hidden_layers")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                LumenError::Format("missing 'num_hidden_layers' in .ltq header config".to_string())
+            })? as usize;
+
+        let preset = match model_type {
+            "qwen4_exp" => "qwen4_exp",
+            "qwen3_next" => "qwen3_next",
+            "qwen3_moe" | "mixtral" | "deepseek_v3" | "gpt_oss" => "moe",
+            "gemma4" | "gemma4_text" => "gemma4",
+            _ => "dense",
+        };
+        Ok(ComponentTree::preset(preset, num_layers))
+    }
+
     /// Serializes this header into a `.ltq` prefix (16-byte binary preamble + space-padded JSON
     /// aligned to `LTQ_DATA_SECTION_ALIGN` = 4096 bytes).
     pub fn to_padded_header_bytes(&self) -> Result<Vec<u8>> {
@@ -188,7 +218,10 @@ pub struct LtqContainer {
 impl LtqContainer {
     /// Opens and memory-maps an `.ltq` file, validating its header and tensor table bounds.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path.as_ref())?;
+        let p = path.as_ref();
+        let file = File::open(p).map_err(|e| {
+            LumenError::Format(format!("cannot open model file '{}': {e}", p.display()))
+        })?;
         // SAFETY: Read-only mapping of an immutable model checkpoint file.
         let mmap = unsafe { Mmap::map(&file)? };
         let (header, data_offset) = parse_ltq_header_from_slice(&mmap)?;

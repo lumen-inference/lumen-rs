@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 lumen-core.workspace = true
 lumen-config.workspace = true
+lumen-format.workspace = true
 lumen-engine.workspace = true
 lumen-quantize.workspace = true
 lumen-chat.workspace = true

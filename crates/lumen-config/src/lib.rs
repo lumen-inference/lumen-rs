@@ -554,74 +554,6 @@ impl RuntimeConfig {
         })
     }
 
-    /// Infers a default architecture preset and layer count when inspecting a config file
-    /// without a concrete `.ltq` file on disk.
-    pub fn infer_tree_for_inspect(
-        &self,
-        override_preset: Option<&str>,
-        override_layers: Option<usize>,
-    ) -> Result<ComponentTree> {
-        let mut max_selector_layer: Option<usize> = None;
-        let mut mentions_moe = false;
-        let mut mentions_dense_mlp = false;
-        let mut mentions_ple = self.raw_model.contains_key("ple");
-
-        if let Some(hl) = self.raw_model.get("hidden-layers").and_then(Value::as_object) {
-            mentions_moe |= hl.contains_key("moe");
-            mentions_dense_mlp |= hl.contains_key("dense-mlp");
-            for (k, v) in hl {
-                if LayerSelector::looks_like_selector(k) {
-                    let sel = LayerSelector::parse(k)?;
-                    if let Some(max_l) = sel.layers().max() {
-                        max_selector_layer =
-                            Some(max_selector_layer.map_or(max_l, |prev| prev.max(max_l)));
-                    }
-                    if let Some(sub) = v.as_object() {
-                        mentions_moe |= sub.contains_key("moe");
-                        mentions_dense_mlp |= sub.contains_key("dense-mlp");
-                    }
-                }
-            }
-        }
-
-        let path_lower = self.model_path.to_ascii_lowercase();
-        mentions_ple |= path_lower.contains("gemma");
-
-        let preset = if let Some(p) = override_preset {
-            p
-        } else if path_lower.contains("flash-next")
-            || path_lower.contains("qwen4")
-            || (mentions_moe && mentions_ple)
-        {
-            "qwen4_exp"
-        } else if path_lower.contains("qwen3-next")
-            || path_lower.contains("qwen3_next")
-            || mentions_moe
-        {
-            "qwen3_next"
-        } else if path_lower.contains("gemma") {
-            "gemma4"
-        } else if mentions_dense_mlp && !mentions_moe {
-            "dense"
-        } else {
-            "canonical-superset"
-        };
-
-        let num_layers = if let Some(n) = override_layers {
-            n
-        } else if let Some(max_l) = max_selector_layer {
-            max_l + 1
-        } else if path_lower.contains("27b") {
-            64
-        } else if path_lower.contains("flash-next") {
-            48
-        } else {
-            32
-        };
-
-        Ok(ComponentTree::preset(preset, num_layers))
-    }
-
     /// Resolves the cascading configuration rules against the given `ComponentTree` into a
     /// validated, flat `PlacementPlan`.
     pub fn resolve_plan(&self, tree: ComponentTree, strict: bool) -> Result<PlacementPlan> {
@@ -1206,10 +1138,7 @@ mod tests {
     fn test_example_dense_config_resolution() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/example-dense.json");
         let cfg = RuntimeConfig::from_file(&path).expect("example-dense.json should parse");
-        let tree = cfg
-            .infer_tree_for_inspect(None, None)
-            .expect("tree inference should succeed");
-        assert_eq!(tree.num_hidden_layers, 64);
+        let tree = ComponentTree::preset("dense", 64);
 
         let plan = cfg
             .resolve_plan(tree, true)
@@ -1249,10 +1178,7 @@ mod tests {
     fn test_example_moe_config_resolution() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/example-moe.json");
         let cfg = RuntimeConfig::from_file(&path).expect("example-moe.json should parse");
-        let tree = cfg
-            .infer_tree_for_inspect(None, None)
-            .expect("tree inference should succeed");
-        assert_eq!(tree.num_hidden_layers, 48);
+        let tree = ComponentTree::preset("qwen4_exp", 48);
 
         let plan = cfg
             .resolve_plan(tree, true)
@@ -1282,6 +1208,30 @@ mod tests {
         let exp_l32 = plan.layers[32][&ComponentPath::new("moe/routed-experts/projections")];
         assert_eq!(exp_l32.compute, Device::Cuda(0));
         assert_eq!(exp_l32.store, MemLoc::Vram(0));
+    }
+
+    #[test]
+    fn test_absent_components_recorded_in_skipped_rules() {
+        let json = r#"{
+            "model": {
+                "path": "Qwen3.8-27B.ltq",
+                "compute": "cuda:0",
+                "store": "vram:0",
+                "ple": {
+                    "table": { "store": "disk" }
+                },
+                "hidden-layers": {
+                    "attention": {
+                        "indexer": { "store": "ram:0" }
+                    },
+                    "hyper-connections": { "compute": "cpu:0" }
+                }
+            }
+        }"#;
+        let cfg = RuntimeConfig::from_json_str(json).unwrap();
+        let tree = ComponentTree::preset("dense", 64);
+        let plan = cfg.resolve_plan(tree, true).unwrap();
+        assert_eq!(plan.provenance.skipped_rules.len(), 3);
     }
 
     #[test]

@@ -191,6 +191,7 @@ dependencies = [
  "lumen-config",
  "lumen-core",
  "lumen-engine",
+ "lumen-format",
  "lumen-quantize",
  "lumen-server",
  "serde_json",
