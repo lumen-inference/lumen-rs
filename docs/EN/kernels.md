@@ -32,9 +32,10 @@ On the GPU, custom CUDA C++ kernels decode LTQ tiles and execute model operators
 | **Norms (`RMSNorm`, `1 + w`, `RMSNormGated`), `RoPE`, `SwiGLU`/`GeGLU`, `Router`, `Sample`** | Custom CUDA C++ | Elementwise ops and warp reductions fused with neighboring operators, plus Philox RNG sampling. |
 
 ### GPU Implementation Details
-- **`RoPE` Variants (`RopeSpec`):** default; `partial` (Qwen) — rotates the first $r$ dimensions; proportional (`p-RoPE`, Gemma 4) — frequencies $\theta^{-2i/d}$ for the first $p \cdot d / 2$ angles at full $d$, remaining angles zero, with `rotate-half` across the full head (rotating slices $[0, p \cdot d / 2)$ and $[d/2, d/2 + p \cdot d / 2)$); `YaRN`; 3D `M-RoPE` partitioning angles into $(t, h, w)$ sections.
-- **Attention inside CUDA Graphs:** because grid dimensions are baked into a captured graph while sequence lengths change every step, `split-K` partitioning parameters are computed on-device from `StepInputs`.
-- **Programmatic Dependent Launch (PDL):** on `sm_90+` GPUs, launching via `cudaLaunchKernelEx` with PDL allows the next kernel to begin its prologue while the previous kernel finishes writing its final blocks.
+- **`RoPE` Variants (`RopeSpec`):** default; `partial` (Qwen) — rotates the first $r$ dimensions with frequencies $\theta^{-2i/r}$; proportional (`p-RoPE`, Gemma 4) — frequencies $\theta^{-2i/d}$ for the first $p \cdot d / 2$ angles at full $d$, remaining angles zero, with `rotate-half` across the full head (rotating slices $[0, p \cdot d / 2)$ and $[d/2, d/2 + p \cdot d / 2)$); `YaRN`; 3D `M-RoPE` partitioning angles into $(t, h, w)$ sections.
+- **Attention inside CUDA Graphs:** because grid dimensions are baked into a captured graph while sequence lengths change every step, `split-K` partitioning parameters are computed on-device from `StepInputs`. Paged FlashInfer decode accepts a per-request page list (used directly for QSA indexer block lists).
+- **Cost of LTQ Decoding on GPU:** the theoretical minimum is ~5–6 integer ops and one `shared memory` read per weight. The `fp32`-FMA GEMV prototype ([`ltq-research/src/cuda/ltq_matvec_bench.cu`](https://github.com/lumen-inference/ltq-research/blob/main/src/cuda/ltq_matvec_bench.cu), RTX PRO 6000) reaches 0.45–0.72 of the ceiling of an equivalent 4-bit table format (shared-memory bank conflicts are non-critical). To remain VRAM-bandwidth bound at `batch = 1` on consumer GPUs (RTX 5070 Ti / 5080), the kernel uses `int8` activations with `__dp4a`, byte permutes via `__byte_perm` (`prmt`), and 32-weight parallel label assembly from bit planes.
+- **Programmatic Dependent Launch (PDL) and Baseline ISA:** on `sm_90+` GPUs, launching via `cudaLaunchKernelEx` with PDL allows the next kernel to begin its prologue while the previous kernel finishes writing its final blocks. The minimum supported GPU architecture is `sm_80` (Ampere: `bf16`-MMA and `cp.async`).
 
 ---
 
@@ -49,25 +50,23 @@ The performance target for the CPU backend is the measured DRAM memory bandwidth
 2. **Horizontal Band Traversal (`CpuBand16`):**
    The kernel traverses a 16-row horizontal tile band along the $K$ axis while keeping accumulators in vector registers. The `CpuBand16` layout ensures all tiles in the band are stored contiguously in DRAM.
 3. **Decoding and Multiplying 32 Weights (Two Tile Rows) per Step:**
-   - **Label assembly (`label`):** labels for 16 weights in a row are computed by bitwise `XOR` (`vpxor`) of three 16-byte vectors fetched from precomputed L1 tables (16 KB per format) indexed by the `codes` bytes.
+   - **Label assembly (`label`):** labels for 16 weights in a row are computed by bitwise `XOR` (`vpxor`) of three 16-byte vectors fetched from precomputed L1 tables (9 history bits + 2 row bytes, 16 KB of tables per format) indexed by the `codes` bytes; label bits are pre-shifted to their final positions in the level index.
    - **Level index assembly:** the label is combined with uncoded bits (`planes` and `lsb`; in `D2` and `D4` modes the lowest bit is reconstructed via byte shifts and masks).
    - **`int8` codebook lookup (`lut`):** executed via `vpshufb` on AVX2 (using 2 or 4 `vpshufb` + `vpblendvb` for 32- or 64-entry tables) or a single `vpermb` instruction on AVX-512 VBMI.
-   - **Dot product accumulation:** multiplies `int8` weights with the `int8` input via `vpmaddubsw` / `vpdpbusd` (transferring signs via `vpsignb`) and scales the 16-element row sum by $\text{gain} \times d$ in `fp32`.
+   - **Dot product accumulation:** multiplies `int8` weights with the `int8` input via `vpmaddubsw` / `vpdpbusd` (transferring signs to the input via `vpsignb`), scales the 16-element row sum by $\text{gain} \times d$ in `fp32`, and adds `bias` on output.
 
-### Measured CPU Kernel Throughput
+### Measured Throughput, ISA Dispatch, and Work Partitioning on CPU
 
-In single-thread Zen 5 benchmarks with data resident in L2 cache (AVX2 path, [`ltq-research/src/cpu/tcq_avx2_bench.c`](https://github.com/lumen-inference/ltq-research/blob/main/src/cpu/tcq_avx2_bench.c)), decoding and multiplication throughput reaches:
-- **25.6 billion weights/s** at $K = 2$;
-- **25.7 billion weights/s** at $K = 3$;
-- **23.3 billion weights/s** at $K = 4$;
-- **18.0 billion weights/s** at $K = 5$ (fractional `D2`/`D4` modes are 12–14% slower).
-
-For comparison, on the same testbed GGUF's table-based `IQ3_K` achieves 35 billion weights/s and `IQ5_K` / `IQ6_K` achieves 20–21 billion weights/s. Across all cores on target CPUs, the kernel is strictly DRAM-bandwidth bound for all formats of 3 bits/weight and above.
+- **Measured throughput** (single-thread Zen 5 benchmark with data in L2 cache, AVX2 path, [`ltq-research/src/cpu/tcq_avx2_bench.c`](https://github.com/lumen-inference/ltq-research/blob/main/src/cpu/tcq_avx2_bench.c)): **25.6 billion weights/s** at $K = 2$, **25.7** at $K = 3$, **23.3** at $K = 4$, **18.0** at $K = 5$ (fractional `D2`/`D4` modes are 12–14% slower). For comparison, GGUF's table-based `IQ3_K` achieves 35 billion weights/s and `IQ5_K` / `IQ6_K` achieves 20–21 billion weights/s on the same testbed. By instruction count, the kernel executes **~290 operations per 256 weights** vs. a theoretical minimum of **~200 operations** for this format.
+- **Compute vs. memory balance on target CPUs:** on CPUs without AVX-512 (6-core Skylake / Zen 2, DDR4 ~40 GB/s), formats of **3+ bits/weight** are strictly DRAM-bandwidth bound, matching GGUF. At ultra-low **2–2.6 bits/weight** on CPUs without AVX-512, execution becomes compute-bound: up to **~25% tokens/s loss** on a 2.5 bpw model with the current kernel (and up to **~7%** at the 200-op theoretical minimum). On Zen 4/5 with AVX-512, compute headroom is substantially higher.
+- **Dispatch table `[ISA][format]`:** the instruction set `Isa::{Avx2, Avx512Bw, Vnni, Vbmi}` is detected once at startup (`is_x86_feature_detected!`); kernels are compiled as `#[target_feature]` functions specialized over compile-time constants `K`, subset count, and fractional mode, and invoked through a 2D function pointer table `[ISA][format]`.
+- **Static spin-pool work partitioning:** in MoE layers, the unit of work is the pair **`(expert, 16-row band)`** across active experts. In models with fine-grained experts (e.g., `Qwen3.8-Flash-Next` with $640 \times 2560$ expert matrices and $k = 8$ active experts), a single layer produces $8 \times (1280 / 16) = 640$ work units on `gate_up` and $8 \times (2560 / 16) = 1280$ on `down`, making zero-overhead spin-pool work distribution essential.
+- **Batching $M > 4$:** when $M > 4$, CPU execution processes rows in chunks of 4; large prefill batches are more efficiently offloaded to the GPU via `"prefill-compute": "cuda:0"` ([Section 7 of architecture.md](architecture.md#7-plan-compiler-lumen-exec-and-step-execution)).
 
 ---
 
-## 4. Kernel Verification
+## 4. Kernel Verification and References
 
 1. **Bit-exact `lumen-ltq` verification:** the Rust reference decoder in `lumen-ltq` is tested bit-for-bit against the Python reference [`ltq_format.py`](https://github.com/lumen-inference/ltq-research/blob/main/src/ltq_format.py) across golden fixtures covering all 19 menu formats and ring tables.
-2. **Per-kernel tests:** every SIMD and CUDA kernel is verified against `lumen-ltq` across randomized matrix shapes.
-3. **End-to-end model differential tests:** full model graphs are verified against the scalar `lumen-ref` oracle ([roadmap.md](roadmap.md)).
+2. **Per-kernel and end-to-end differential tests:** every SIMD and CUDA kernel is verified against `lumen-ltq` across randomized matrix shapes, and full model graphs are verified against the scalar `lumen-ref` oracle ([roadmap.md](roadmap.md)).
+3. **References:** [NVIDIA CUTLASS & CuTe](https://github.com/NVIDIA/cutlass), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), `cuda-oxide` vs. `CUDA C++` on LTQ GEMV: [`results/kbench_gemv_g4.json`](https://github.com/lumen-inference/ltq-research/blob/main/results/kbench_gemv_g4.json) and [`src/kbench/`](https://github.com/lumen-inference/ltq-research/tree/main/src/kbench).
