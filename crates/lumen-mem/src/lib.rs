@@ -270,6 +270,7 @@ impl ArenaPlanner {
         }
 
         let mut placed: Vec<Placed> = Vec::with_capacity(sorted.len());
+        let mut occupied: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
         let mut total_bytes = 0usize;
 
         for item in sorted {
@@ -285,16 +286,20 @@ impl ArenaPlanner {
             }
 
             // Collect occupied `[offset, offset + size)` ranges that overlap in time with `item`
-            let mut occupied: Vec<(usize, usize)> = placed
-                .iter()
-                .filter(|p| p.size > 0 && !(p.last_op < item.first_op || item.last_op < p.first_op))
-                .map(|p| (p.offset, p.offset + p.size))
-                .collect();
-            occupied.sort_by_key(|&(start, _)| start);
+            occupied.clear();
+            occupied.extend(
+                placed
+                    .iter()
+                    .filter(|p| {
+                        p.size > 0 && !(p.last_op < item.first_op || item.last_op < p.first_op)
+                    })
+                    .map(|p| (p.offset, p.offset + p.size)),
+            );
+            occupied.sort_unstable_by_key(|&(start, _)| start);
 
             // Find the lowest aligned gap >= item.byte_size
             let mut candidate_offset = 0usize;
-            for (occ_start, occ_end) in occupied {
+            for &(occ_start, occ_end) in &occupied {
                 if candidate_offset + item.byte_size <= occ_start {
                     break;
                 }

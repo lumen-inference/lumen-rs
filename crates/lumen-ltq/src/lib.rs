@@ -1,7 +1,7 @@
 //! Reference implementation of the LTQ v1 (Lumen Trellis Quant) specification
 //! (`docs/RU/ltq-format.md`):
 //! - $16 \times 16$ tile and 1D ring (`LtqRing`) packing and decoding (`decode_tile`, `decode_ring`)
-//! - Tail-biting 10-bit trellis state and Ungerboeck polynomial parity masks
+//! - Tail-biting 10-bit trellis state ($O(1)$ shift register) and Ungerboeck parity masks
 //! - Fractional bitrate constraints (`None`, `D2`, `D4`)
 //! - Normalized block Walsh-Hadamard transform ($H_{256}$ and $H_B$)
 
@@ -81,7 +81,7 @@ impl LtqFormat {
     #[inline]
     pub fn tile_bytes(&self, len: usize) -> usize {
         let code_words = len / 16;
-        let plane_words = (len / 16) * self.k.saturating_sub(2);
+        let plane_words = code_words * self.k.saturating_sub(2);
         2 * (code_words + plane_words + self.lsb_words(len) + self.gain_words(len))
     }
 
@@ -135,11 +135,21 @@ impl LtqFormat {
         }
         Ok(())
     }
+
+    /// Computes subset label from a 10-bit trellis state `s`.
+    #[inline]
+    fn state_to_label(&self, s: u32) -> u32 {
+        let hist = s >> 1;
+        let mut label = (s & 1) | ((hist & self.masks[0]).count_ones() & 1) << 1;
+        for (i, &m) in self.masks[1..].iter().enumerate() {
+            label |= ((hist & m).count_ones() & 1) << (2 + i);
+        }
+        label
+    }
 }
 
 /// Decodes 256 unscaled values of a $16 \times 16$ tile per Section 7 of `docs/RU/ltq-format.md`:
 /// `q[t] = gain[g] * lut[label * 2^(K - 1) + u]`, where `t = 16 * r + c`.
-#[allow(clippy::needless_range_loop)]
 pub fn decode_tile(
     f: &LtqFormat,
     codes: &[u16; 16],
@@ -147,47 +157,13 @@ pub fn decode_tile(
     lsb: &[u16],
     gains: &[u16],
 ) -> [f32; 256] {
-    let bit = |w: &[u16], i: usize| ((w[i >> 4] >> (i & 15)) & 1) as u32;
-    let mut q = [0f32; 256];
-
-    for t in 0..256 {
-        let mut s = 0u32; // 10-bit sliding window, tail-biting modulo 256
-        for j in 0..10 {
-            s |= bit(codes, (t + 256 - j) % 256) << j;
-        }
-
-        let mut label = (s & 1) | (((s >> 1) & f.masks[0]).count_ones() & 1) << 1;
-        for (i, m) in f.masks[1..].iter().enumerate() {
-            label |= (((s >> 1) & m).count_ones() & 1) << (2 + i);
-        }
-
-        let mut u = match f.frac {
-            Frac::None => bit(lsb, t),
-            Frac::D2 => bit(lsb, t / 2),
-            Frac::D4 if t % 4 < 3 => bit(lsb, 3 * (t / 4) + t % 4),
-            Frac::D4 => {
-                bit(lsb, 3 * (t / 4))
-                    ^ bit(lsb, 3 * (t / 4) + 1)
-                    ^ bit(lsb, 3 * (t / 4) + 2)
-            }
-        };
-
-        for p in 1..f.k - 1 {
-            u |= bit(&planes[p - 1], t) << p;
-        }
-
-        let mut g = 0usize;
-        for i in 0..f.h {
-            g |= (bit(gains, (t / f.sub) * f.h + i) as usize) << i;
-        }
-        q[t] = f.gain[g] * f.lut[((label as usize) << (f.k - 1)) | u as usize];
-    }
+    let mut q = [0f32; TILE];
+    decode_ring(f, TILE, codes, planes.as_flattened(), lsb, gains, &mut q);
     q
 }
 
-/// Decodes a general tail-biting LTQ ring of length `len` (where `len` is a multiple of 16,
-/// e.g. `len = 256` for tiles/PLE or `len = 160` for n-gram row tables).
-#[allow(clippy::needless_range_loop)]
+/// Decodes a tail-biting LTQ ring of length `len` (`len` is a multiple of 16, e.g. `256` or `160`)
+/// using an $O(1)$ 10-bit shift register for the trellis state $s_t$.
 pub fn decode_ring(
     f: &LtqFormat,
     len: usize,
@@ -202,63 +178,59 @@ pub fn decode_ring(
     let words_per_plane = len / 16;
     let bit = |w: &[u16], i: usize| ((w[i >> 4] >> (i & 15)) & 1) as u32;
 
-    for t in 0..len {
-        let mut s = 0u32;
-        for j in 0..NU {
-            s |= bit(codes, (t + len - j) % len) << j;
-        }
+    // Seed the 9 history bits from the tail of the ring: (len - 9)..len
+    let mut s = 0u32;
+    for idx in (len - (NU - 1))..len {
+        s = (s << 1) | bit(codes, idx);
+    }
 
-        let mut label = (s & 1) | (((s >> 1) & f.masks[0]).count_ones() & 1) << 1;
-        for (i, m) in f.masks[1..].iter().enumerate() {
-            label |= (((s >> 1) & m).count_ones() & 1) << (2 + i);
-        }
+    for (t, out_val) in out.iter_mut().enumerate() {
+        // Advance 10-bit shift register in O(1): bit 0 is c_t, bits 1..=9 are c_{t-1}..c_{t-9}
+        s = ((s << 1) & 0x3FF) | bit(codes, t);
+        let label = f.state_to_label(s);
 
         let mut u = match f.frac {
             Frac::None => bit(lsb, t),
             Frac::D2 => bit(lsb, t / 2),
             Frac::D4 if t % 4 < 3 => bit(lsb, 3 * (t / 4) + t % 4),
             Frac::D4 => {
-                bit(lsb, 3 * (t / 4))
-                    ^ bit(lsb, 3 * (t / 4) + 1)
-                    ^ bit(lsb, 3 * (t / 4) + 2)
+                let base = 3 * (t / 4);
+                bit(lsb, base) ^ bit(lsb, base + 1) ^ bit(lsb, base + 2)
             }
         };
 
         for p in 1..f.k - 1 {
-            let plane_slice = &planes[(p - 1) * words_per_plane..p * words_per_plane];
-            u |= bit(plane_slice, t) << p;
+            let plane = &planes[(p - 1) * words_per_plane..p * words_per_plane];
+            u |= bit(plane, t) << p;
         }
 
         let mut g = 0usize;
+        let g_base = (t / f.sub) * f.h;
         for i in 0..f.h {
-            g |= (bit(gains, (t / f.sub) * f.h + i) as usize) << i;
+            g |= (bit(gains, g_base + i) as usize) << i;
         }
-        out[t] = f.gain[g] * f.lut[((label as usize) << (f.k - 1)) | u as usize];
+        *out_val = f.gain[g] * f.lut[((label as usize) << (f.k - 1)) | (u as usize)];
     }
 }
 
-/// Computes the 256-element trellis states $s_t$ and subset labels $\text{label}_t$ from `codes`.
+/// Computes the trellis subset labels $\text{label}_t$ from `code_bits` using an $O(1)$ shift register.
 pub fn labels_from_code_bits(f: &LtqFormat, code_bits: &[u8]) -> Vec<u32> {
     let len = code_bits.len();
-    let mut labels = vec![0u32; len];
-    for t in 0..len {
-        let mut s = 0u32;
-        for j in 0..NU {
-            s |= u32::from(code_bits[(t + len - j) % len] & 1) << j;
-        }
-        let mut label = (s & 1) | (((s >> 1) & f.masks[0]).count_ones() & 1) << 1;
-        for (i, m) in f.masks[1..].iter().enumerate() {
-            label |= (((s >> 1) & m).count_ones() & 1) << (2 + i);
-        }
-        labels[t] = label;
+    let mut s = 0u32;
+    for &b in &code_bits[len - (NU - 1)..] {
+        s = (s << 1) | u32::from(b & 1);
     }
-    labels
+    code_bits
+        .iter()
+        .map(|&b| {
+            s = ((s << 1) & 0x3FF) | u32::from(b & 1);
+            f.state_to_label(s)
+        })
+        .collect()
 }
 
-/// Packs `labels`, uncoded indices `u`, and subgroup gain indices `gidx` (one per element, sampled
-/// every `f.sub` positions) into `(codes, planes, lsb, gains)` `u16` word arrays.
-///
-/// Matches `pack_tile` in `ltq_format.py`.
+/// Packs `labels`, uncoded indices `u`, and subgroup gain indices `gidx` directly into
+/// `(codes, planes, lsb, gains)` `u16` word arrays without intermediate bit-vector allocations.
 pub fn pack_ring(
     f: &LtqFormat,
     labels: &[u32],
@@ -271,46 +243,55 @@ pub fn pack_ring(
     assert_eq!(gidx.len(), len);
 
     let words_per_plane = len / 16;
-    let pack_bits = |bits: &[u32], n_words: usize| -> Vec<u16> {
-        let mut out = vec![0u16; n_words];
-        for (i, &b) in bits.iter().enumerate() {
-            if (b & 1) != 0 {
-                out[i >> 4] |= 1u16 << (i & 15);
-            }
+    let set_bit = |words: &mut [u16], bit_idx: usize, val: u32| {
+        if (val & 1) != 0 {
+            words[bit_idx >> 4] |= 1u16 << (bit_idx & 15);
         }
-        out
     };
 
-    let code_bits: Vec<u32> = labels.iter().map(|&l| l & 1).collect();
-    let codes = pack_bits(&code_bits, words_per_plane);
-
-    let mut planes = Vec::with_capacity(words_per_plane * f.k.saturating_sub(2));
-    for p in 1..f.k.saturating_sub(1) {
-        let p_bits: Vec<u32> = u.iter().map(|&val| (val >> p) & 1).collect();
-        planes.extend_from_slice(&pack_bits(&p_bits, words_per_plane));
+    let mut codes = vec![0u16; words_per_plane];
+    for (i, &l) in labels.iter().enumerate() {
+        set_bit(&mut codes, i, l);
     }
 
-    let lsb_bits: Vec<u32> = match f.frac {
-        Frac::None => u.iter().map(|&v| v & 1).collect(),
-        Frac::D2 => u.iter().step_by(2).map(|&v| v & 1).collect(),
-        Frac::D4 => u
-            .chunks_exact(4)
-            .flat_map(|q| [q[0] & 1, q[1] & 1, q[2] & 1])
-            .collect(),
-    };
-    let lsb = pack_bits(&lsb_bits, f.lsb_words(len));
+    let num_planes = f.k.saturating_sub(2);
+    let mut planes = vec![0u16; words_per_plane * num_planes];
+    for p in 1..f.k.saturating_sub(1) {
+        let slice = &mut planes[(p - 1) * words_per_plane..p * words_per_plane];
+        for (i, &val) in u.iter().enumerate() {
+            set_bit(slice, i, val >> p);
+        }
+    }
 
-    let gains = if f.h > 0 {
-        let mut g_bits = Vec::with_capacity((len / f.sub) * f.h);
-        for &g in gidx.iter().step_by(f.sub) {
-            for bit_idx in 0..f.h {
-                g_bits.push((g >> bit_idx) & 1);
+    let mut lsb = vec![0u16; f.lsb_words(len)];
+    match f.frac {
+        Frac::None => {
+            for (i, &v) in u.iter().enumerate() {
+                set_bit(&mut lsb, i, v);
             }
         }
-        pack_bits(&g_bits, f.gain_words(len))
-    } else {
-        Vec::new()
-    };
+        Frac::D2 => {
+            for (i, &v) in u.iter().step_by(2).enumerate() {
+                set_bit(&mut lsb, i, v);
+            }
+        }
+        Frac::D4 => {
+            for (q, quad) in u.chunks_exact(4).enumerate() {
+                set_bit(&mut lsb, 3 * q, quad[0]);
+                set_bit(&mut lsb, 3 * q + 1, quad[1]);
+                set_bit(&mut lsb, 3 * q + 2, quad[2]);
+            }
+        }
+    }
+
+    let mut gains = vec![0u16; f.gain_words(len)];
+    if f.h > 0 {
+        for (grp, &g) in gidx.iter().step_by(f.sub).enumerate() {
+            for bit_idx in 0..f.h {
+                set_bit(&mut gains, grp * f.h + bit_idx, g >> bit_idx);
+            }
+        }
+    }
 
     (codes, planes, lsb, gains)
 }
@@ -321,8 +302,6 @@ pub fn pack_ring(
 
 /// Applies an in-place normalized Walsh-Hadamard transform of block size `block_size`
 /// (where `block_size` is a power of two, e.g. `256` or `32`) to every contiguous block of `data`.
-///
-/// Since $H_B$ is symmetric and orthogonal with scale $1 / \sqrt{B}$, applying it twice is the identity.
 pub fn hadamard_blocks_inplace(data: &mut [f32], block_size: usize) {
     assert!(
         block_size.is_power_of_two() && block_size > 0,
@@ -375,7 +354,6 @@ mod tests {
     /// in the LTQ v1 menu table (`docs/RU/ltq-format.md` Section 5).
     #[test]
     fn test_ltq_v1_menu_sizes_and_bpw() {
-        // (name, K, frac, masks_count, h, sub, expected_lut_len, expected_bytes, expected_bpw_k4096)
         let menu = [
             ("TCQ2X0", 2, Frac::None, 3, 0, 16, 32, 64, 2.035),
             ("TCQ2X", 2, Frac::None, 3, 1, 16, 32, 66, 2.098),
@@ -410,11 +388,7 @@ mod tests {
                 gain: vec![1.0; 1 << h],
             };
             fmt.validate().expect("format should be valid");
-            assert_eq!(
-                fmt.tile_bytes(256),
-                exp_bytes,
-                "tile_bytes mismatch for {name}"
-            );
+            assert_eq!(fmt.tile_bytes(256), exp_bytes, "tile_bytes mismatch for {name}");
             let bpw_rounded = (fmt.bpw(4096) * 1000.0).round() / 1000.0;
             assert!(
                 (bpw_rounded - exp_bpw).abs() < 1e-6,
@@ -451,7 +425,6 @@ mod tests {
             };
             fmt.validate().unwrap();
 
-            // Deterministic pseudo-random code bits, uncoded bits (satisfying D2/D4), and gains
             let code_bits: Vec<u8> = (0..256).map(|t| ((t * 7 + 3) % 2) as u8).collect();
             let labels = labels_from_code_bits(&fmt, &code_bits);
 
@@ -478,7 +451,7 @@ mod tests {
                 .collect();
 
             let (codes, planes_flat, lsb, gains) = pack_ring(&fmt, &labels, &u, &gidx);
-            let codes_arr: [u16; 16] = codes.clone().try_into().unwrap();
+            let codes_arr: [u16; 16] = codes.try_into().unwrap();
             let planes_arr: Vec<[u16; 16]> = planes_flat
                 .chunks_exact(16)
                 .map(|c| c.try_into().unwrap())
@@ -487,8 +460,8 @@ mod tests {
             let decoded = decode_tile(&fmt, &codes_arr, &planes_arr, &lsb, &gains);
 
             for t in 0..256 {
-                let expected =
-                    fmt.gain[gidx[t] as usize] * fmt.lut[(labels[t] as usize) * u_levels + u[t] as usize];
+                let expected = fmt.gain[gidx[t] as usize]
+                    * fmt.lut[(labels[t] as usize) * u_levels + u[t] as usize];
                 assert_eq!(
                     decoded[t].to_bits(),
                     expected.to_bits(),
@@ -503,12 +476,10 @@ mod tests {
         let orig: Vec<f32> = (0..512).map(|i| (i as f32) * 0.01 - 1.28).collect();
         let mut buf = orig.clone();
         hadamard_blocks_inplace(&mut buf, 256);
-        // After one transform, energy (L2 norm) is preserved
         let norm_orig: f32 = orig.iter().map(|x| x * x).sum();
         let norm_rot: f32 = buf.iter().map(|x| x * x).sum();
         assert!((norm_orig - norm_rot).abs() < 1e-3);
 
-        // Applying H_256 a second time recovers the original vector
         hadamard_blocks_inplace(&mut buf, 256);
         for (a, b) in orig.iter().zip(buf.iter()) {
             assert!((a - b).abs() < 1e-5);

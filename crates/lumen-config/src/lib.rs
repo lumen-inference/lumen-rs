@@ -8,6 +8,7 @@ use std::path::Path;
 use lumen_core::{
     AccessMode, ComponentKind, ComponentPath, ComponentTree, Device, LumenError, MemLoc, Result,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -44,8 +45,6 @@ impl Place {
     }
 
     /// Access mode during prefill for a component of the given `ComponentKind`.
-    /// When `prefill-compute` is explicitly overridden to a GPU for RAM-stored weights
-    /// (e.g. `moe/routed-experts` or `dense-mlp`), weights are streamed H2D per chunk (`Streamed`).
     #[inline]
     pub const fn prefill_access_mode(&self, kind: ComponentKind) -> AccessMode {
         let sparse = if self.prefill_compute.is_some() {
@@ -91,10 +90,7 @@ impl PlaceOrigin {
                 _ => self.compute_source.clone(),
             }
         } else {
-            format!(
-                "compute: {}, store: {}",
-                self.compute_source, self.store_source
-            )
+            format!("compute: {}, store: {}", self.compute_source, self.store_source)
         }
     }
 }
@@ -112,15 +108,10 @@ pub struct Provenance {
 #[derive(Clone, Debug)]
 pub struct PlacementPlan {
     pub tree: ComponentTree,
-    /// Placement of global (non-layer) components (`input-layer`, `ple/table`, `output-layer/lm-head`, etc.).
     pub global: BTreeMap<ComponentPath, Place>,
-    /// Per-layer placement indexed by `0..num_hidden_layers`.
     pub layers: Vec<BTreeMap<ComponentPath, Place>>,
-    /// Per-layer KV cache placement for layers that contain an `attention/kv-cache` node.
     pub kv: Vec<KvPlacement>,
-    /// Per-layer recurrent state placement for layers that contain a `linear-attention/state` node.
     pub state: Vec<StatePlacement>,
-    /// Rule provenance and diagnostics for `lumen inspect`.
     pub provenance: Provenance,
 }
 
@@ -129,6 +120,7 @@ pub struct PlacementPlan {
 // ============================================================================
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct SamplingConfig {
     pub temperature: f32,
     pub top_p: f32,
@@ -148,12 +140,13 @@ impl Default for SamplingConfig {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct ChatTemplateConfig {
-    #[serde(default)]
     pub kwargs: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct ContextConfig {
     pub size: usize,
 }
@@ -165,12 +158,14 @@ impl Default for ContextConfig {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct KvQuantizationConfig {
     pub k_bits: u8,
     pub v_bits: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct CudaRuntimeConfig {
     pub prefill_chunk_size: usize,
     pub cuda_graphs: bool,
@@ -186,6 +181,7 @@ impl Default for CudaRuntimeConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct CpuRuntimeConfig {
     pub threads: usize,
     pub reserve_cores: usize,
@@ -203,6 +199,7 @@ impl Default for CpuRuntimeConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct DiskRuntimeConfig {
     pub io_threads: usize,
     pub mlock: bool,
@@ -218,6 +215,7 @@ impl Default for DiskRuntimeConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct ServerRuntimeConfig {
     pub host: String,
     pub port: u16,
@@ -284,8 +282,9 @@ pub struct LayerSelector {
 
 impl LayerSelector {
     /// Returns `true` if `key` looks like a layer selector (starts with an ASCII digit).
+    #[inline]
     pub fn looks_like_selector(key: &str) -> bool {
-        key.chars().next().is_some_and(|c| c.is_ascii_digit())
+        key.as_bytes().first().is_some_and(u8::is_ascii_digit)
     }
 
     pub fn parse(key: &str) -> Result<Self> {
@@ -329,7 +328,7 @@ impl LayerSelector {
 }
 
 // ============================================================================
-// Known Keys & Typo Suggestion (Damerau-Levenshtein)
+// Known Keys & Stack-Allocated Damerau-Levenshtein Typo Suggestion
 // ============================================================================
 
 const TOP_LEVEL_KEYS: &[&str] = &[
@@ -355,91 +354,36 @@ const MODEL_META_KEYS: &[&str] = &[
     "hidden-layers",
 ];
 
-/// Canonical global component prefixes allowed under `"model"` even if a specific model
-/// does not use them (in which case they are recorded as skipped in `Provenance`).
-const KNOWN_GLOBAL_PREFIXES: &[&str] = &[
-    "input-layer",
-    "ple",
-    "ple/table",
-    "ple/projections",
-    "vision-tower",
-    "audio-tower",
-    "output-layer",
-    "output-layer/norm",
-    "output-layer/lm-head",
-    "mtp",
-];
-
-/// Canonical per-layer component prefixes allowed under `"hidden-layers"` even if a specific
-/// model/layer does not use them.
-const KNOWN_LAYER_PREFIXES: &[&str] = &[
-    "norms",
-    "norms/input-norm",
-    "norms/post-attention-norm",
-    "attention",
-    "attention/q",
-    "attention/k",
-    "attention/v",
-    "attention/o",
-    "attention/qk-norm",
-    "attention/rope",
-    "attention/indexer",
-    "attention/indexer/keys",
-    "attention/kv-cache",
-    "linear-attention",
-    "linear-attention/projections",
-    "linear-attention/projections/qkv",
-    "linear-attention/projections/z",
-    "linear-attention/projections/b",
-    "linear-attention/projections/a",
-    "linear-attention/projections/qkvz",
-    "linear-attention/projections/ba",
-    "linear-attention/projections/out",
-    "linear-attention/conv",
-    "linear-attention/norm",
-    "linear-attention/state",
-    "hyper-connections",
-    "dense-mlp",
-    "dense-mlp/gate",
-    "dense-mlp/up",
-    "dense-mlp/down",
-    "moe",
-    "moe/router",
-    "moe/shared-experts",
-    "moe/shared-experts/gate",
-    "moe/shared-experts/projections",
-    "moe/routed-experts",
-    "moe/routed-experts/projections",
-];
-
+/// Zero-allocation stack-based Damerau-Levenshtein distance for ASCII config keys (`len <= 63`).
 fn edit_distance(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let m = a_chars.len();
-    let n = b_chars.len();
-    let mut dp = vec![vec![0usize; n + 1]; m + 1];
-    for (i, row) in dp.iter_mut().enumerate().take(m + 1) {
-        row[0] = i;
+    const MAX_LEN: usize = 63;
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let m = a.len().min(MAX_LEN);
+    let n = b.len().min(MAX_LEN);
+
+    let mut prev2 = [0u8; MAX_LEN + 1];
+    let mut prev1 = [0u8; MAX_LEN + 1];
+    let mut curr = [0u8; MAX_LEN + 1];
+
+    for (j, slot) in prev1.iter_mut().enumerate().take(n + 1) {
+        *slot = j as u8;
     }
-    for (j, val) in dp[0].iter_mut().enumerate().take(n + 1) {
-        *val = j;
-    }
+
     for i in 1..=m {
+        curr[0] = i as u8;
         for j in 1..=n {
-            let cost = usize::from(a_chars[i - 1] != b_chars[j - 1]);
-            dp[i][j] = (dp[i - 1][j] + 1)
-                .min(dp[i][j - 1] + 1)
-                .min(dp[i - 1][j - 1] + cost);
-            if i > 1
-                && j > 1
-                && a_chars[i - 1] == b_chars[j - 2]
-                && a_chars[i - 2] == b_chars[j - 1]
-            {
-                dp[i][j] = dp[i][j].min(dp[i - 2][j - 2] + 1);
+            let cost = u8::from(a[i - 1] != b[j - 1]);
+            let mut best = (prev1[j] + 1).min(curr[j - 1] + 1).min(prev1[j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(prev2[j - 2] + 1);
             }
+            curr[j] = best;
         }
+        prev2 = prev1;
+        prev1 = curr;
     }
-    dp[m][n]
+    usize::from(prev1[n])
 }
 
 fn suggest_key<'a>(unknown: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
@@ -451,14 +395,37 @@ fn suggest_key<'a>(unknown: &str, candidates: impl IntoIterator<Item = &'a str>)
         .map(|(cand, _)| cand)
 }
 
-fn unknown_key_error(scope: &str, key: &str, valid: &[&str]) -> LumenError {
-    if let Some(suggestion) = suggest_key(key, valid.iter().copied()) {
+fn unknown_key_error<'a>(
+    scope: &str,
+    key: &str,
+    valid: impl IntoIterator<Item = &'a str>,
+) -> LumenError {
+    if let Some(suggestion) = suggest_key(key, valid) {
         LumenError::Config(format!(
             "unknown key '{key}' in {scope}; did you mean '{suggestion}'?"
         ))
     } else {
         LumenError::Config(format!("unknown key '{key}' in {scope}"))
     }
+}
+
+fn parse_section<T: DeserializeOwned>(
+    val: Option<&Value>,
+    scope: &str,
+    valid_keys: &[&str],
+) -> Result<Option<T>> {
+    let Some(v) = val else { return Ok(None) };
+    let obj = v
+        .as_object()
+        .ok_or_else(|| LumenError::Config(format!("'{scope}' must be an object")))?;
+    for k in obj.keys() {
+        if !valid_keys.contains(&k.as_str()) {
+            return Err(unknown_key_error(scope, k, valid_keys.iter().copied()));
+        }
+    }
+    serde_json::from_value(v.clone())
+        .map(Some)
+        .map_err(|e| LumenError::Config(format!("invalid '{scope}': {e}")))
 }
 
 // ============================================================================
@@ -482,7 +449,11 @@ impl RuntimeConfig {
 
         for key in root.keys() {
             if !TOP_LEVEL_KEYS.contains(&key.as_str()) {
-                return Err(unknown_key_error("top-level config", key, TOP_LEVEL_KEYS));
+                return Err(unknown_key_error(
+                    "top-level config",
+                    key,
+                    TOP_LEVEL_KEYS.iter().copied(),
+                ));
             }
         }
 
@@ -497,53 +468,66 @@ impl RuntimeConfig {
             .ok_or_else(|| LumenError::Config("missing required 'model.path' string".to_string()))?
             .to_string();
 
-        let sampling = if let Some(s_val) = model_obj.get("sampling") {
-            parse_sampling(s_val)?
-        } else {
-            SamplingConfig::default()
-        };
+        let sampling = parse_section::<SamplingConfig>(
+            model_obj.get("sampling"),
+            "model.sampling",
+            &["temperature", "top-p", "top-k", "min-p"],
+        )?
+        .unwrap_or_default();
 
-        let chat_template = if let Some(ct_val) = root.get("chat-template") {
-            parse_chat_template(ct_val)?
-        } else {
-            ChatTemplateConfig::default()
-        };
+        let chat_template = parse_section::<ChatTemplateConfig>(
+            root.get("chat-template"),
+            "chat-template",
+            &["kwargs"],
+        )?
+        .unwrap_or_default();
 
-        let context = if let Some(ctx_val) = root.get("context") {
-            parse_context(ctx_val)?
-        } else {
-            ContextConfig::default()
-        };
+        let context = parse_section::<ContextConfig>(root.get("context"), "context", &["size"])?
+            .unwrap_or_default();
+        if context.size == 0 {
+            return Err(LumenError::Config(
+                "'context.size' must be greater than 0".to_string(),
+            ));
+        }
 
-        let kv_quantization = if let Some(kv_val) = root.get("kv-quantization") {
-            Some(parse_kv_quantization(kv_val)?)
-        } else {
-            None
-        };
+        let kv_quantization = parse_section::<KvQuantizationConfig>(
+            root.get("kv-quantization"),
+            "kv-quantization",
+            &["k-bits", "v-bits"],
+        )?;
+        if let Some(kvq) = kv_quantization
+            && (!(2..=8).contains(&kvq.k_bits) || !(2..=8).contains(&kvq.v_bits))
+        {
+            return Err(LumenError::Config(format!(
+                "'kv-quantization' bits must be in 2..=8 (got k-bits={}, v-bits={})",
+                kvq.k_bits, kvq.v_bits
+            )));
+        }
 
-        let cuda = if let Some(cuda_val) = root.get("cuda") {
-            parse_cuda_config(cuda_val)?
-        } else {
-            CudaRuntimeConfig::default()
-        };
+        let cuda = parse_section::<CudaRuntimeConfig>(
+            root.get("cuda"),
+            "cuda",
+            &["prefill-chunk-size", "cuda-graphs"],
+        )?
+        .unwrap_or_default();
 
-        let cpu = if let Some(cpu_val) = root.get("cpu") {
-            parse_cpu_config(cpu_val)?
-        } else {
-            CpuRuntimeConfig::default()
-        };
+        let cpu = parse_section::<CpuRuntimeConfig>(
+            root.get("cpu"),
+            "cpu",
+            &["threads", "reserve-cores", "numa-spread"],
+        )?
+        .unwrap_or_default();
 
-        let disk = if let Some(disk_val) = root.get("disk") {
-            parse_disk_config(disk_val)?
-        } else {
-            DiskRuntimeConfig::default()
-        };
+        let disk =
+            parse_section::<DiskRuntimeConfig>(root.get("disk"), "disk", &["io-threads", "mlock"])?
+                .unwrap_or_default();
 
-        let server = if let Some(srv_val) = root.get("server") {
-            parse_server_config(srv_val)?
-        } else {
-            ServerRuntimeConfig::default()
-        };
+        let server = parse_section::<ServerRuntimeConfig>(
+            root.get("server"),
+            "server",
+            &["host", "port", "max-concurrent-requests"],
+        )?
+        .unwrap_or_default();
 
         let attention_mechanism = match root.get("attention-mechanism") {
             Some(v) => v
@@ -577,19 +561,14 @@ impl RuntimeConfig {
         override_preset: Option<&str>,
         override_layers: Option<usize>,
     ) -> Result<ComponentTree> {
-        // Scan layer selectors under hidden-layers to find the highest referenced layer index
         let mut max_selector_layer: Option<usize> = None;
         let mut mentions_moe = false;
         let mut mentions_dense_mlp = false;
         let mut mentions_ple = self.raw_model.contains_key("ple");
 
         if let Some(hl) = self.raw_model.get("hidden-layers").and_then(Value::as_object) {
-            if hl.contains_key("moe") {
-                mentions_moe = true;
-            }
-            if hl.contains_key("dense-mlp") {
-                mentions_dense_mlp = true;
-            }
+            mentions_moe |= hl.contains_key("moe");
+            mentions_dense_mlp |= hl.contains_key("dense-mlp");
             for (k, v) in hl {
                 if LayerSelector::looks_like_selector(k) {
                     let sel = LayerSelector::parse(k)?;
@@ -598,27 +577,27 @@ impl RuntimeConfig {
                             Some(max_selector_layer.map_or(max_l, |prev| prev.max(max_l)));
                     }
                     if let Some(sub) = v.as_object() {
-                        if sub.contains_key("moe") {
-                            mentions_moe = true;
-                        }
-                        if sub.contains_key("dense-mlp") {
-                            mentions_dense_mlp = true;
-                        }
+                        mentions_moe |= sub.contains_key("moe");
+                        mentions_dense_mlp |= sub.contains_key("dense-mlp");
                     }
                 }
             }
         }
 
         let path_lower = self.model_path.to_ascii_lowercase();
-        if path_lower.contains("gemma") {
-            mentions_ple = true;
-        }
+        mentions_ple |= path_lower.contains("gemma");
 
         let preset = if let Some(p) = override_preset {
             p
-        } else if path_lower.contains("flash-next") || path_lower.contains("qwen4") || (mentions_moe && mentions_ple) {
+        } else if path_lower.contains("flash-next")
+            || path_lower.contains("qwen4")
+            || (mentions_moe && mentions_ple)
+        {
             "qwen4_exp"
-        } else if path_lower.contains("qwen3-next") || path_lower.contains("qwen3_next") || mentions_moe {
+        } else if path_lower.contains("qwen3-next")
+            || path_lower.contains("qwen3_next")
+            || mentions_moe
+        {
             "qwen3_next"
         } else if path_lower.contains("gemma") {
             "gemma4"
@@ -646,6 +625,7 @@ impl RuntimeConfig {
     /// Resolves the cascading configuration rules against the given `ComponentTree` into a
     /// validated, flat `PlacementPlan`.
     pub fn resolve_plan(&self, tree: ComponentTree, strict: bool) -> Result<PlacementPlan> {
+        let superset = ComponentTree::canonical_superset(1);
         let mut provenance = Provenance {
             global_origins: BTreeMap::new(),
             layer_origins: vec![BTreeMap::new(); tree.num_hidden_layers],
@@ -653,12 +633,12 @@ impl RuntimeConfig {
             warnings: Vec::new(),
         };
 
-        // 1. Validate keys in "model" and collect global rules first (so typos like "stor"
-        //    produce a "did you mean 'store'?" error before checking required base keys).
+        // 1. Validate keys in "model" and collect global rules
         let mut global_rules: BTreeMap<ComponentPath, PartialPlace> = BTreeMap::new();
-        let valid_global_roots: Vec<&str> = KNOWN_GLOBAL_PREFIXES
+        let valid_global_roots: Vec<&str> = superset
+            .global_prefixes
             .iter()
-            .copied()
+            .map(ComponentPath::as_str)
             .filter(|p| !p.contains('/'))
             .chain(MODEL_META_KEYS.iter().copied())
             .collect();
@@ -668,10 +648,12 @@ impl RuntimeConfig {
                 continue;
             }
             let path = ComponentPath::new(key);
-            if !KNOWN_GLOBAL_PREFIXES.contains(&path.as_str())
-                && !tree.is_valid_global_path(&path)
-            {
-                return Err(unknown_key_error("model", key, &valid_global_roots));
+            if !superset.is_valid_global_path(&path) && !tree.is_valid_global_path(&path) {
+                return Err(unknown_key_error(
+                    "model",
+                    key,
+                    valid_global_roots.iter().copied(),
+                ));
             }
             collect_subtree_rules(
                 val,
@@ -679,6 +661,7 @@ impl RuntimeConfig {
                 &format!("model.{key}"),
                 false,
                 &tree,
+                &superset,
                 &mut global_rules,
                 &mut provenance.skipped_rules,
             )?;
@@ -704,7 +687,6 @@ impl RuntimeConfig {
                 LumenError::Config("'model.hidden-layers' must be an object".to_string())
             })?;
 
-            // Base placement keys directly on "hidden-layers"
             let hl_self = extract_partial_place(hl_obj, "hidden-layers")?;
             if hl_self.compute.is_some()
                 || hl_self.store.is_some()
@@ -713,9 +695,10 @@ impl RuntimeConfig {
                 general_layer_rules.insert(ComponentPath::new(""), hl_self);
             }
 
-            let valid_layer_roots: Vec<&str> = KNOWN_LAYER_PREFIXES
+            let valid_layer_roots: Vec<&str> = superset
+                .layer_prefixes
                 .iter()
-                .copied()
+                .map(ComponentPath::as_str)
                 .filter(|p| !p.contains('/'))
                 .chain(PLACEMENT_KEYS.iter().copied())
                 .collect();
@@ -756,57 +739,26 @@ impl RuntimeConfig {
                         provenance.warnings.push(msg);
                     }
 
-                    // Parse subtree inside the selector
-                    let sel_obj = val.as_object().ok_or_else(|| {
-                        LumenError::Config(format!(
-                            "layer selector '{}' in 'hidden-layers' must be an object",
-                            selector.raw
-                        ))
-                    })?;
                     let sel_origin = format!("hidden-layers[\"{}\"]", selector.raw);
                     let mut parsed_sel_rules: BTreeMap<ComponentPath, PartialPlace> =
                         BTreeMap::new();
-
-                    let sel_self = extract_partial_place(sel_obj, &sel_origin)?;
-                    if sel_self.compute.is_some()
-                        || sel_self.store.is_some()
-                        || sel_self.prefill_compute.is_some()
-                    {
-                        parsed_sel_rules.insert(ComponentPath::new(""), sel_self);
-                    }
-
-                    for (sub_k, sub_v) in sel_obj {
-                        if PLACEMENT_KEYS.contains(&sub_k.as_str()) {
-                            continue;
-                        }
-                        let sub_path = ComponentPath::new(sub_k);
-                        if !KNOWN_LAYER_PREFIXES.contains(&sub_path.as_str())
-                            && !tree.is_valid_layer_path(&sub_path)
-                        {
-                            return Err(unknown_key_error(
-                                &sel_origin,
-                                sub_k,
-                                &valid_layer_roots,
-                            ));
-                        }
-                        collect_subtree_rules(
-                            sub_v,
-                            &sub_path,
-                            &format!("{sel_origin}.{sub_k}"),
-                            true,
-                            &tree,
-                            &mut parsed_sel_rules,
-                            &mut provenance.skipped_rules,
-                        )?;
-                    }
+                    collect_subtree_rules(
+                        val,
+                        &ComponentPath::new(""),
+                        &sel_origin,
+                        true,
+                        &tree,
+                        &superset,
+                        &mut parsed_sel_rules,
+                        &mut provenance.skipped_rules,
+                    )?;
 
                     for layer_idx in in_range {
                         for (p, r) in &parsed_sel_rules {
-                            // Check if this rule applies to any active component on this specific layer
                             let applies_on_layer = p.is_empty()
                                 || tree.layer_leaves.values().any(|leaf| {
                                     leaf.path.starts_with_path(p)
-                                        && leaf.active_layers.contains(&layer_idx)
+                                        && leaf.active_layers.contains(layer_idx)
                                 });
                             if !applies_on_layer {
                                 let skip_msg = format!(
@@ -821,13 +773,11 @@ impl RuntimeConfig {
                     }
                 } else {
                     let path = ComponentPath::new(key);
-                    if !KNOWN_LAYER_PREFIXES.contains(&path.as_str())
-                        && !tree.is_valid_layer_path(&path)
-                    {
+                    if !superset.is_valid_layer_path(&path) && !tree.is_valid_layer_path(&path) {
                         return Err(unknown_key_error(
                             "hidden-layers",
                             key,
-                            &valid_layer_roots,
+                            valid_layer_roots.iter().copied(),
                         ));
                     }
                     collect_subtree_rules(
@@ -836,6 +786,7 @@ impl RuntimeConfig {
                         &format!("hidden-layers.{key}"),
                         true,
                         &tree,
+                        &superset,
                         &mut general_layer_rules,
                         &mut provenance.skipped_rules,
                     )?;
@@ -851,7 +802,6 @@ impl RuntimeConfig {
                 store: Some(base_store.clone()),
                 prefill_compute: root_place.prefill_compute.clone(),
             };
-            // Walk prefixes from shortest to longest
             let mut prefix = ComponentPath::new("");
             for seg in path.segments() {
                 prefix = prefix.join(seg);
@@ -864,20 +814,18 @@ impl RuntimeConfig {
             provenance.global_origins.insert(path.clone(), origin);
         }
 
-        // 5. Resolve every per-layer leaf component according to priority order:
-        //    Priority 3: Root "model"
-        //    Priority 2: General "hidden-layers" (from shallowest to deepest prefix)
-        //    Priority 1: Layer selector matching layer `l` (from shallowest to deepest prefix)
+        // 5. Resolve every per-layer leaf component
         let mut layers = vec![BTreeMap::new(); tree.num_hidden_layers];
         let mut kv = Vec::new();
         let mut state = Vec::new();
 
         let kv_path = ComponentPath::new("attention/kv-cache");
         let state_path = ComponentPath::new("linear-attention/state");
+        let empty_path = ComponentPath::new("");
 
         for layer_idx in 0..tree.num_hidden_layers {
             for (path, leaf) in &tree.layer_leaves {
-                if !leaf.active_layers.contains(&layer_idx) {
+                if !leaf.active_layers.contains(layer_idx) {
                     continue;
                 }
                 let mut resolved = PartialPlace {
@@ -886,28 +834,16 @@ impl RuntimeConfig {
                     prefill_compute: root_place.prefill_compute.clone(),
                 };
 
-                // Priority 2: general hidden-layers rules
-                if let Some(root_hl) = general_layer_rules.get(&ComponentPath::new("")) {
-                    resolved.merge_from(root_hl);
-                }
-                let mut prefix = ComponentPath::new("");
-                for seg in path.segments() {
-                    prefix = prefix.join(seg);
-                    if let Some(rule) = general_layer_rules.get(&prefix) {
-                        resolved.merge_from(rule);
+                for rules_map in [&general_layer_rules, &selector_layer_rules[layer_idx]] {
+                    if let Some(root_rule) = rules_map.get(&empty_path) {
+                        resolved.merge_from(root_rule);
                     }
-                }
-
-                // Priority 1: layer selector rules (override general hidden-layers at any depth)
-                if let Some(root_sel) = selector_layer_rules[layer_idx].get(&ComponentPath::new(""))
-                {
-                    resolved.merge_from(root_sel);
-                }
-                let mut prefix = ComponentPath::new("");
-                for seg in path.segments() {
-                    prefix = prefix.join(seg);
-                    if let Some(rule) = selector_layer_rules[layer_idx].get(&prefix) {
-                        resolved.merge_from(rule);
+                    let mut prefix = ComponentPath::new("");
+                    for seg in path.segments() {
+                        prefix = prefix.join(seg);
+                        if let Some(rule) = rules_map.get(&prefix) {
+                            resolved.merge_from(rule);
+                        }
                     }
                 }
 
@@ -969,9 +905,9 @@ fn finalize_place(resolved: PartialPlace) -> (Place, PlaceOrigin) {
 fn extract_partial_place(obj: &Map<String, Value>, origin: &str) -> Result<PartialPlace> {
     let mut partial = PartialPlace::default();
     if let Some(c_val) = obj.get("compute") {
-        let s = c_val.as_str().ok_or_else(|| {
-            LumenError::Config(format!("'{origin}.compute' must be a string"))
-        })?;
+        let s = c_val
+            .as_str()
+            .ok_or_else(|| LumenError::Config(format!("'{origin}.compute' must be a string")))?;
         partial.compute = Some((s.parse::<Device>()?, origin.to_string()));
     }
     if let Some(s_val) = obj.get("store") {
@@ -989,12 +925,14 @@ fn extract_partial_place(obj: &Map<String, Value>, origin: &str) -> Result<Parti
     Ok(partial)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_subtree_rules(
     val: &Value,
     current_path: &ComponentPath,
     origin: &str,
     is_layer: bool,
     tree: &ComponentTree,
+    superset: &ComponentTree,
     out_rules: &mut BTreeMap<ComponentPath, PartialPlace>,
     skipped_rules: &mut Vec<String>,
 ) -> Result<()> {
@@ -1003,13 +941,14 @@ fn collect_subtree_rules(
         .ok_or_else(|| LumenError::Config(format!("'{origin}' must be an object")))?;
 
     let partial = extract_partial_place(obj, origin)?;
-    let exists_in_tree = if is_layer {
-        tree.layer_leaves.values().any(|leaf| {
-            leaf.path.starts_with_path(current_path) && !leaf.active_layers.is_empty()
-        })
-    } else {
-        tree.is_valid_global_path(current_path)
-    };
+    let exists_in_tree = current_path.is_empty()
+        || if is_layer {
+            tree.layer_leaves.values().any(|leaf| {
+                leaf.path.starts_with_path(current_path) && !leaf.active_layers.is_empty()
+            })
+        } else {
+            tree.is_valid_global_path(current_path)
+        };
 
     if partial.compute.is_some() || partial.store.is_some() || partial.prefill_compute.is_some() {
         if exists_in_tree {
@@ -1025,18 +964,22 @@ fn collect_subtree_rules(
         }
     }
 
-    // Valid child keys at `current_path`
     let known_prefixes = if is_layer {
-        KNOWN_LAYER_PREFIXES
+        &superset.layer_prefixes
     } else {
-        KNOWN_GLOBAL_PREFIXES
+        &superset.global_prefixes
     };
-    let prefix_slash = format!("{}/", current_path.as_str());
     let mut valid_children: BTreeSet<&str> = PLACEMENT_KEYS.iter().copied().collect();
-    for &kp in known_prefixes {
-        if let Some(rest) = kp.strip_prefix(&prefix_slash) {
-            let child_seg = rest.split('/').next().unwrap_or(rest);
-            valid_children.insert(child_seg);
+    for kp in known_prefixes {
+        let rest_opt = if current_path.is_empty() {
+            Some(kp.as_str())
+        } else {
+            kp.as_str()
+                .strip_prefix(current_path.as_str())
+                .and_then(|s| s.strip_prefix('/'))
+        };
+        if let Some(rest) = rest_opt {
+            valid_children.insert(rest.split('/').next().unwrap_or(rest));
         }
     }
 
@@ -1045,15 +988,18 @@ fn collect_subtree_rules(
             continue;
         }
         let child_path = current_path.join(child_k);
-        let child_known = known_prefixes.contains(&child_path.as_str())
+        let child_known = known_prefixes.contains(&child_path)
             || if is_layer {
                 tree.is_valid_layer_path(&child_path)
             } else {
                 tree.is_valid_global_path(&child_path)
             };
         if !child_known {
-            let cand_vec: Vec<&str> = valid_children.iter().copied().collect();
-            return Err(unknown_key_error(origin, child_k, &cand_vec));
+            return Err(unknown_key_error(
+                origin,
+                child_k,
+                valid_children.iter().copied(),
+            ));
         }
         collect_subtree_rules(
             child_v,
@@ -1061,234 +1007,13 @@ fn collect_subtree_rules(
             &format!("{origin}.{child_k}"),
             is_layer,
             tree,
+            superset,
             out_rules,
             skipped_rules,
         )?;
     }
 
     Ok(())
-}
-
-// ============================================================================
-// Section Parsers
-// ============================================================================
-
-fn parse_sampling(val: &Value) -> Result<SamplingConfig> {
-    let obj = val
-        .as_object()
-        .ok_or_else(|| LumenError::Config("'model.sampling' must be an object".to_string()))?;
-    const VALID: &[&str] = &["temperature", "top-p", "top-k", "min-p"];
-    for k in obj.keys() {
-        if !VALID.contains(&k.as_str()) {
-            return Err(unknown_key_error("model.sampling", k, VALID));
-        }
-    }
-    let mut cfg = SamplingConfig::default();
-    if let Some(v) = obj.get("temperature") {
-        cfg.temperature = v.as_f64().ok_or_else(|| {
-            LumenError::Config("'model.sampling.temperature' must be a number".to_string())
-        })? as f32;
-    }
-    if let Some(v) = obj.get("top-p") {
-        cfg.top_p = v.as_f64().ok_or_else(|| {
-            LumenError::Config("'model.sampling.top-p' must be a number".to_string())
-        })? as f32;
-    }
-    if let Some(v) = obj.get("top-k") {
-        cfg.top_k = v.as_u64().ok_or_else(|| {
-            LumenError::Config("'model.sampling.top-k' must be an integer".to_string())
-        })? as u32;
-    }
-    if let Some(v) = obj.get("min-p") {
-        cfg.min_p = v.as_f64().ok_or_else(|| {
-            LumenError::Config("'model.sampling.min-p' must be a number".to_string())
-        })? as f32;
-    }
-    Ok(cfg)
-}
-
-fn parse_chat_template(val: &Value) -> Result<ChatTemplateConfig> {
-    let obj = val
-        .as_object()
-        .ok_or_else(|| LumenError::Config("'chat-template' must be an object".to_string()))?;
-    const VALID: &[&str] = &["kwargs"];
-    for k in obj.keys() {
-        if !VALID.contains(&k.as_str()) {
-            return Err(unknown_key_error("chat-template", k, VALID));
-        }
-    }
-    let mut kwargs = BTreeMap::new();
-    if let Some(kw_val) = obj.get("kwargs") {
-        let kw_obj = kw_val.as_object().ok_or_else(|| {
-            LumenError::Config("'chat-template.kwargs' must be an object".to_string())
-        })?;
-        for (k, v) in kw_obj {
-            kwargs.insert(k.clone(), v.clone());
-        }
-    }
-    Ok(ChatTemplateConfig { kwargs })
-}
-
-fn parse_context(val: &Value) -> Result<ContextConfig> {
-    let obj = val
-        .as_object()
-        .ok_or_else(|| LumenError::Config("'context' must be an object".to_string()))?;
-    const VALID: &[&str] = &["size"];
-    for k in obj.keys() {
-        if !VALID.contains(&k.as_str()) {
-            return Err(unknown_key_error("context", k, VALID));
-        }
-    }
-    let mut cfg = ContextConfig::default();
-    if let Some(v) = obj.get("size") {
-        cfg.size = v
-            .as_u64()
-            .ok_or_else(|| LumenError::Config("'context.size' must be a positive integer".to_string()))?
-            as usize;
-        if cfg.size == 0 {
-            return Err(LumenError::Config(
-                "'context.size' must be greater than 0".to_string(),
-            ));
-        }
-    }
-    Ok(cfg)
-}
-
-fn parse_kv_quantization(val: &Value) -> Result<KvQuantizationConfig> {
-    let obj = val
-        .as_object()
-        .ok_or_else(|| LumenError::Config("'kv-quantization' must be an object".to_string()))?;
-    const VALID: &[&str] = &["k-bits", "v-bits"];
-    for k in obj.keys() {
-        if !VALID.contains(&k.as_str()) {
-            return Err(unknown_key_error("kv-quantization", k, VALID));
-        }
-    }
-    let k_bits = obj
-        .get("k-bits")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| LumenError::Config("'kv-quantization.k-bits' is required".to_string()))?
-        as u8;
-    let v_bits = obj
-        .get("v-bits")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| LumenError::Config("'kv-quantization.v-bits' is required".to_string()))?
-        as u8;
-    if !(2..=8).contains(&k_bits) || !(2..=8).contains(&v_bits) {
-        return Err(LumenError::Config(format!(
-            "'kv-quantization' bits must be in 2..=8 (got k-bits={k_bits}, v-bits={v_bits})"
-        )));
-    }
-    Ok(KvQuantizationConfig { k_bits, v_bits })
-}
-
-fn parse_cuda_config(val: &Value) -> Result<CudaRuntimeConfig> {
-    let obj = val
-        .as_object()
-        .ok_or_else(|| LumenError::Config("'cuda' must be an object".to_string()))?;
-    const VALID: &[&str] = &["prefill-chunk-size", "cuda-graphs"];
-    for k in obj.keys() {
-        if !VALID.contains(&k.as_str()) {
-            return Err(unknown_key_error("cuda", k, VALID));
-        }
-    }
-    let mut cfg = CudaRuntimeConfig::default();
-    if let Some(v) = obj.get("prefill-chunk-size") {
-        cfg.prefill_chunk_size = v.as_u64().ok_or_else(|| {
-            LumenError::Config("'cuda.prefill-chunk-size' must be an integer".to_string())
-        })? as usize;
-    }
-    if let Some(v) = obj.get("cuda-graphs") {
-        cfg.cuda_graphs = v.as_bool().ok_or_else(|| {
-            LumenError::Config("'cuda.cuda-graphs' must be a boolean".to_string())
-        })?;
-    }
-    Ok(cfg)
-}
-
-fn parse_cpu_config(val: &Value) -> Result<CpuRuntimeConfig> {
-    let obj = val
-        .as_object()
-        .ok_or_else(|| LumenError::Config("'cpu' must be an object".to_string()))?;
-    const VALID: &[&str] = &["threads", "reserve-cores", "numa-spread"];
-    for k in obj.keys() {
-        if !VALID.contains(&k.as_str()) {
-            return Err(unknown_key_error("cpu", k, VALID));
-        }
-    }
-    let mut cfg = CpuRuntimeConfig::default();
-    if let Some(v) = obj.get("threads") {
-        cfg.threads = v
-            .as_u64()
-            .ok_or_else(|| LumenError::Config("'cpu.threads' must be an integer".to_string()))?
-            as usize;
-    }
-    if let Some(v) = obj.get("reserve-cores") {
-        cfg.reserve_cores = v.as_u64().ok_or_else(|| {
-            LumenError::Config("'cpu.reserve-cores' must be an integer".to_string())
-        })? as usize;
-    }
-    if let Some(v) = obj.get("numa-spread") {
-        cfg.numa_spread = v
-            .as_bool()
-            .ok_or_else(|| LumenError::Config("'cpu.numa-spread' must be a boolean".to_string()))?;
-    }
-    Ok(cfg)
-}
-
-fn parse_disk_config(val: &Value) -> Result<DiskRuntimeConfig> {
-    let obj = val
-        .as_object()
-        .ok_or_else(|| LumenError::Config("'disk' must be an object".to_string()))?;
-    const VALID: &[&str] = &["io-threads", "mlock"];
-    for k in obj.keys() {
-        if !VALID.contains(&k.as_str()) {
-            return Err(unknown_key_error("disk", k, VALID));
-        }
-    }
-    let mut cfg = DiskRuntimeConfig::default();
-    if let Some(v) = obj.get("io-threads") {
-        cfg.io_threads = v.as_u64().ok_or_else(|| {
-            LumenError::Config("'disk.io-threads' must be an integer".to_string())
-        })? as usize;
-    }
-    if let Some(v) = obj.get("mlock") {
-        cfg.mlock = v
-            .as_bool()
-            .ok_or_else(|| LumenError::Config("'disk.mlock' must be a boolean".to_string()))?;
-    }
-    Ok(cfg)
-}
-
-fn parse_server_config(val: &Value) -> Result<ServerRuntimeConfig> {
-    let obj = val
-        .as_object()
-        .ok_or_else(|| LumenError::Config("'server' must be an object".to_string()))?;
-    const VALID: &[&str] = &["host", "port", "max-concurrent-requests"];
-    for k in obj.keys() {
-        if !VALID.contains(&k.as_str()) {
-            return Err(unknown_key_error("server", k, VALID));
-        }
-    }
-    let mut cfg = ServerRuntimeConfig::default();
-    if let Some(v) = obj.get("host") {
-        cfg.host = v
-            .as_str()
-            .ok_or_else(|| LumenError::Config("'server.host' must be a string".to_string()))?
-            .to_string();
-    }
-    if let Some(v) = obj.get("port") {
-        cfg.port = v
-            .as_u64()
-            .ok_or_else(|| LumenError::Config("'server.port' must be an integer".to_string()))?
-            as u16;
-    }
-    if let Some(v) = obj.get("max-concurrent-requests") {
-        cfg.max_concurrent_requests = v.as_u64().ok_or_else(|| {
-            LumenError::Config("'server.max-concurrent-requests' must be an integer".to_string())
-        })? as usize;
-    }
-    Ok(cfg)
 }
 
 // ============================================================================
@@ -1337,7 +1062,6 @@ impl PlacementPlan {
             cfg.disk.io_threads, cfg.disk.mlock
         );
 
-        // Global components table
         let _ = writeln!(out, "\n--- Global Components ---");
         let _ = writeln!(
             out,
@@ -1351,7 +1075,6 @@ impl PlacementPlan {
             let prefill_str = place
                 .prefill_compute
                 .map_or_else(|| "-".to_string(), |d| d.to_string());
-            let origin_str = self.provenance.global_origins[path].summary();
             let _ = writeln!(
                 out,
                 "{:<26} {:<8} {:<8} {:<10} {:<12} {:<12} {}",
@@ -1361,19 +1084,16 @@ impl PlacementPlan {
                 prefill_str,
                 place.decode_access_mode(leaf.kind).as_str(),
                 place.prefill_access_mode(leaf.kind).as_str(),
-                origin_str
+                self.provenance.global_origins[path].summary()
             );
         }
 
-        // Group hidden layers with identical placement maps and provenance
         let _ = writeln!(
             out,
             "\n--- Hidden Layers (0..{}) ---",
             self.tree.num_hidden_layers.saturating_sub(1)
         );
-        let groups = self.group_identical_layers();
-
-        for (layers_list, map_idx) in groups {
+        for (layers_list, map_idx) in self.group_identical_layers() {
             let range_label = format_layer_index_list(&layers_list);
             let _ = writeln!(out, "\n[Layers {range_label}] ({} layers):", layers_list.len());
             let _ = writeln!(
@@ -1388,7 +1108,6 @@ impl PlacementPlan {
                 let prefill_str = place
                     .prefill_compute
                     .map_or_else(|| "-".to_string(), |d| d.to_string());
-                let origin_str = self.provenance.layer_origins[map_idx][path].summary();
                 let _ = writeln!(
                     out,
                     "  {:<36} {:<8} {:<8} {:<10} {:<12} {:<12} {}",
@@ -1398,7 +1117,7 @@ impl PlacementPlan {
                     prefill_str,
                     place.decode_access_mode(leaf.kind).as_str(),
                     place.prefill_access_mode(leaf.kind).as_str(),
-                    origin_str
+                    self.provenance.layer_origins[map_idx][path].summary()
                 );
             }
         }
@@ -1449,20 +1168,20 @@ fn format_layer_index_list(indices: &[usize]) -> String {
         if idx == prev + 1 {
             prev = idx;
         } else {
-            if start == prev {
-                parts.push(format!("{start}"));
+            parts.push(if start == prev {
+                format!("{start}")
             } else {
-                parts.push(format!("{start}-{prev}"));
-            }
+                format!("{start}-{prev}")
+            });
             start = idx;
             prev = idx;
         }
     }
-    if start == prev {
-        parts.push(format!("{start}"));
+    parts.push(if start == prev {
+        format!("{start}")
     } else {
-        parts.push(format!("{start}-{prev}"));
-    }
+        format!("{start}-{prev}")
+    });
     parts.join(", ")
 }
 
@@ -1496,7 +1215,6 @@ mod tests {
             .resolve_plan(tree, true)
             .expect("plan resolution should succeed");
 
-        // Input layer has store overridden to ram:0, compute inherited as cuda:0 -> ZeroCopy
         let input_place = plan.global[&ComponentPath::new("input-layer")];
         assert_eq!(input_place.store, MemLoc::Ram(0));
         assert_eq!(input_place.compute, Device::Cuda(0));
@@ -1505,7 +1223,6 @@ mod tests {
             AccessMode::ZeroCopy
         );
 
-        // Layers 0..35: dense-mlp/gate is on cpu:0 / ram:0 with prefill-compute = cuda:0
         let mlp_l0 = plan.layers[0][&ComponentPath::new("dense-mlp/gate")];
         assert_eq!(mlp_l0.compute, Device::Cpu(0));
         assert_eq!(mlp_l0.store, MemLoc::Ram(0));
@@ -1519,7 +1236,6 @@ mod tests {
             AccessMode::Streamed
         );
 
-        // Layers 36..63: dense-mlp/gate overridden to cuda:0 / vram:0
         let mlp_l36 = plan.layers[36][&ComponentPath::new("dense-mlp/gate")];
         assert_eq!(mlp_l36.compute, Device::Cuda(0));
         assert_eq!(mlp_l36.store, MemLoc::Vram(0));
@@ -1542,7 +1258,6 @@ mod tests {
             .resolve_plan(tree, true)
             .expect("plan resolution should succeed");
 
-        // PLE table is stored on disk, computed on cuda:0 -> FetchH2d
         let ple_table = plan.global[&ComponentPath::new("ple/table")];
         assert_eq!(ple_table.store, MemLoc::Disk);
         assert_eq!(ple_table.compute, Device::Cuda(0));
@@ -1551,7 +1266,6 @@ mod tests {
             AccessMode::FetchH2d
         );
 
-        // Routed experts on layer 0: cpu:0 / ram:0 (prefill: cuda:0)
         let exp_l0 = plan.layers[0][&ComponentPath::new("moe/routed-experts/projections")];
         assert_eq!(exp_l0.compute, Device::Cpu(0));
         assert_eq!(exp_l0.store, MemLoc::Ram(0));
@@ -1565,7 +1279,6 @@ mod tests {
             AccessMode::Streamed
         );
 
-        // Routed experts on layer 32: cuda:0 / vram:0
         let exp_l32 = plan.layers[32][&ComponentPath::new("moe/routed-experts/projections")];
         assert_eq!(exp_l32.compute, Device::Cuda(0));
         assert_eq!(exp_l32.store, MemLoc::Vram(0));
@@ -1623,11 +1336,8 @@ mod tests {
         let cfg = RuntimeConfig::from_json_str(json).unwrap();
         let tree = ComponentTree::preset("dense", 16);
 
-        // Non-strict produces a warning
         let plan = cfg.resolve_plan(tree.clone(), false).unwrap();
         assert_eq!(plan.provenance.warnings.len(), 1);
-
-        // Strict returns an error
         assert!(cfg.resolve_plan(tree, true).is_err());
     }
 }

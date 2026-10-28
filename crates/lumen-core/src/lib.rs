@@ -1,6 +1,6 @@
 //! Foundational types for `lumen-rs`: data types (`DType`), tensor shapes (`Shape`),
 //! compute devices (`Device`), storage locations (`MemLoc`), data access modes (`AccessMode`),
-//! model component paths (`ComponentPath`, `ComponentTree`), and error types (`LumenError`).
+//! model component paths (`ComponentPath`, `ComponentTree`, `LayerMask`), and error types (`LumenError`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -40,7 +40,7 @@ pub enum LumenError {
 }
 
 // ============================================================================
-// DType
+// DType & Shape
 // ============================================================================
 
 /// Scalar element data type for tensors and container descriptors.
@@ -118,10 +118,6 @@ impl FromStr for DType {
     }
 }
 
-// ============================================================================
-// Shape
-// ============================================================================
-
 /// Multi-dimensional tensor shape.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -191,7 +187,7 @@ impl fmt::Display for Shape {
 }
 
 // ============================================================================
-// Device & MemLoc & AccessMode
+// Device, MemLoc & AccessMode
 // ============================================================================
 
 /// Compute device executing operators (`"cpu:0"`, `"cuda:0"`).
@@ -235,28 +231,26 @@ impl FromStr for Device {
     type Err = LumenError;
 
     fn from_str(s: &str) -> Result<Self> {
-        let s = s.trim();
-        if s == "cpu" {
-            return Ok(Self::Cpu(0));
-        }
-        if s == "cuda" {
-            return Ok(Self::Cuda(0));
-        }
-        if let Some((kind, idx_str)) = s.split_once(':') {
-            let idx = idx_str.parse::<u16>().map_err(|_| {
-                LumenError::Config(format!("invalid device index in '{s}' (expected u16)"))
-            })?;
-            match kind {
-                "cpu" => Ok(Self::Cpu(idx)),
-                "cuda" => Ok(Self::Cuda(idx)),
-                _ => Err(LumenError::Config(format!(
-                    "unknown compute device '{s}' (expected 'cpu:N' or 'cuda:G')"
-                ))),
+        match s.trim() {
+            "cpu" => Ok(Self::Cpu(0)),
+            "cuda" => Ok(Self::Cuda(0)),
+            other => {
+                let (kind, idx_str) = other.split_once(':').ok_or_else(|| {
+                    LumenError::Config(format!(
+                        "invalid compute device '{other}' (expected 'cpu:N' or 'cuda:G')"
+                    ))
+                })?;
+                let idx = idx_str.parse::<u16>().map_err(|_| {
+                    LumenError::Config(format!("invalid device index in '{other}' (expected u16)"))
+                })?;
+                match kind {
+                    "cpu" => Ok(Self::Cpu(idx)),
+                    "cuda" => Ok(Self::Cuda(idx)),
+                    _ => Err(LumenError::Config(format!(
+                        "unknown compute device '{other}' (expected 'cpu:N' or 'cuda:G')"
+                    ))),
+                }
             }
-        } else {
-            Err(LumenError::Config(format!(
-                "invalid compute device '{s}' (expected 'cpu:N' or 'cuda:G')"
-            )))
         }
     }
 }
@@ -269,8 +263,9 @@ impl Serialize for Device {
 
 impl<'de> Deserialize<'de> for Device {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        s.parse().map_err(serde::de::Error::custom)
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -316,28 +311,29 @@ impl FromStr for MemLoc {
     type Err = LumenError;
 
     fn from_str(s: &str) -> Result<Self> {
-        let s = s.trim();
-        match s {
-            "disk" => return Ok(Self::Disk),
-            "ram" => return Ok(Self::Ram(0)),
-            "vram" => return Ok(Self::Vram(0)),
-            _ => {}
-        }
-        if let Some((kind, idx_str)) = s.split_once(':') {
-            let idx = idx_str.parse::<u16>().map_err(|_| {
-                LumenError::Config(format!("invalid memory location index in '{s}' (expected u16)"))
-            })?;
-            match kind {
-                "ram" => Ok(Self::Ram(idx)),
-                "vram" => Ok(Self::Vram(idx)),
-                _ => Err(LumenError::Config(format!(
-                    "unknown memory location '{s}' (expected 'ram:N', 'vram:G', or 'disk')"
-                ))),
+        match s.trim() {
+            "disk" => Ok(Self::Disk),
+            "ram" => Ok(Self::Ram(0)),
+            "vram" => Ok(Self::Vram(0)),
+            other => {
+                let (kind, idx_str) = other.split_once(':').ok_or_else(|| {
+                    LumenError::Config(format!(
+                        "invalid memory location '{other}' (expected 'ram:N', 'vram:G', or 'disk')"
+                    ))
+                })?;
+                let idx = idx_str.parse::<u16>().map_err(|_| {
+                    LumenError::Config(format!(
+                        "invalid memory location index in '{other}' (expected u16)"
+                    ))
+                })?;
+                match kind {
+                    "ram" => Ok(Self::Ram(idx)),
+                    "vram" => Ok(Self::Vram(idx)),
+                    _ => Err(LumenError::Config(format!(
+                        "unknown memory location '{other}' (expected 'ram:N', 'vram:G', or 'disk')"
+                    ))),
+                }
             }
-        } else {
-            Err(LumenError::Config(format!(
-                "invalid memory location '{s}' (expected 'ram:N', 'vram:G', or 'disk')"
-            )))
         }
     }
 }
@@ -350,14 +346,15 @@ impl Serialize for MemLoc {
 
 impl<'de> Deserialize<'de> for MemLoc {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        s.parse().map_err(serde::de::Error::custom)
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
 /// Data access mode determined at plan compilation from `(store, compute, sparse_access)`.
 ///
-/// Corresponds to the 3x4 access matrix in `docs/RU/architecture.md` (Section 3).
+/// Corresponds to the $3 \times 4$ access matrix in `docs/RU/architecture.md` (Section 3).
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum AccessMode {
     /// Local memory access (`vram:G` -> `cuda:G` or `ram:N` -> `cpu:N`).
@@ -371,7 +368,9 @@ pub enum AccessMode {
     /// NVMe disk rows pre-fetched into pinned RAM and then copied H2D to GPU VRAM.
     FetchH2d,
     /// VRAM data copied back (D2H) to pinned RAM for CPU execution.
-    Readback, PeerCopy,
+    Readback,
+    /// Cross-GPU peer-to-peer copy (`vram:G1` -> `cuda:G2`).
+    PeerCopy,
 }
 
 impl AccessMode {
@@ -415,7 +414,7 @@ impl fmt::Display for AccessMode {
 }
 
 // ============================================================================
-// ComponentPath & ComponentTree
+// ComponentPath, LayerMask & ComponentTree
 // ============================================================================
 
 /// Slash-separated path identifying a component in the model hierarchy
@@ -426,9 +425,7 @@ pub struct ComponentPath(String);
 
 impl ComponentPath {
     pub fn new(path: impl Into<String>) -> Self {
-        let s = path.into();
-        let trimmed = s.trim_matches('/').to_string();
-        Self(trimmed)
+        Self(path.into().trim_matches('/').to_string())
     }
 
     #[inline]
@@ -459,15 +456,12 @@ impl ComponentPath {
 
     /// Returns `true` if `self` is equal to `prefix` or is a descendant path under `prefix/`.
     pub fn starts_with_path(&self, prefix: &ComponentPath) -> bool {
-        if prefix.0.is_empty() {
-            return true;
-        }
-        if self.0 == prefix.0 {
-            return true;
-        }
-        self.0
-            .strip_prefix(&prefix.0)
-            .is_some_and(|rest| rest.starts_with('/'))
+        prefix.0.is_empty()
+            || self.0 == prefix.0
+            || self
+                .0
+                .strip_prefix(&prefix.0)
+                .is_some_and(|rest| rest.starts_with('/'))
     }
 }
 
@@ -480,6 +474,59 @@ impl fmt::Display for ComponentPath {
 impl From<&str> for ComponentPath {
     fn from(s: &str) -> Self {
         Self::new(s)
+    }
+}
+
+/// Zero-allocation $O(1)$ bitmask of active layer indices (supports up to 128 layers).
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub struct LayerMask(pub u128);
+
+impl LayerMask {
+    pub const EMPTY: Self = Self(0);
+
+    /// Bitmask with all layers `0..num_layers` set.
+    #[inline]
+    pub const fn all(num_layers: usize) -> Self {
+        if num_layers == 0 {
+            Self(0)
+        } else if num_layers >= 128 {
+            Self(u128::MAX)
+        } else {
+            Self((1u128 << num_layers) - 1)
+        }
+    }
+
+    /// Bitmask built from a predicate `f(layer_idx)`.
+    pub fn from_fn(num_layers: usize, mut f: impl FnMut(usize) -> bool) -> Self {
+        let mut bits = 0u128;
+        for l in 0..num_layers.min(128) {
+            if f(l) {
+                bits |= 1u128 << l;
+            }
+        }
+        Self(bits)
+    }
+
+    #[inline]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[inline]
+    pub const fn contains(self, layer: usize) -> bool {
+        layer < 128 && ((self.0 >> layer) & 1) != 0
+    }
+
+    #[inline]
+    pub fn insert(&mut self, layer: usize) {
+        if layer < 128 {
+            self.0 |= 1u128 << layer;
+        }
+    }
+
+    #[inline]
+    pub fn union_with(&mut self, other: Self) {
+        self.0 |= other.0;
     }
 }
 
@@ -499,7 +546,6 @@ pub enum ComponentKind {
 }
 
 impl ComponentKind {
-    /// Whether accesses to this component are sparse (selecting rows/experts/pages).
     #[inline]
     pub const fn is_sparse(self) -> bool {
         matches!(self, Self::SparseWeight)
@@ -511,16 +557,11 @@ impl ComponentKind {
 pub struct ComponentLeaf {
     pub path: ComponentPath,
     pub kind: ComponentKind,
-    /// For per-layer components: the set of layer indices `[0, num_layers)` where this
-    /// component actually exists in the loaded model. Empty for global components.
-    pub active_layers: BTreeSet<usize>,
+    /// Bitmask of layer indices `[0, num_layers)` where this component exists (`EMPTY` for globals).
+    pub active_layers: LayerMask,
 }
 
 /// Model component hierarchy produced by `Architecture::components()`.
-///
-/// Used by `lumen-config` to validate JSON paths, resolve cascading rules into a flat
-/// `PlacementPlan`, and power `lumen inspect` without hardcoding model-specific logic in
-/// the config parser.
 #[derive(Clone, Debug)]
 pub struct ComponentTree {
     pub model_name: String,
@@ -556,57 +597,54 @@ impl ComponentTree {
             ComponentLeaf {
                 path,
                 kind,
-                active_layers: BTreeSet::new(),
+                active_layers: LayerMask::EMPTY,
             },
         );
     }
 
-    /// Registers a per-layer leaf component active on the given `layers` and all its parent prefixes.
+    /// Registers a per-layer leaf component active on `mask` and all its parent prefixes.
     pub fn add_layer(
         &mut self,
         path: impl Into<ComponentPath>,
         kind: ComponentKind,
-        layers: impl IntoIterator<Item = usize>,
+        mask: LayerMask,
     ) {
         let path = path.into();
         self.register_prefixes(&path, true);
-        let active_layers: BTreeSet<usize> = layers.into_iter().collect();
         self.layer_leaves
             .entry(path.clone())
-            .and_modify(|leaf| leaf.active_layers.extend(&active_layers))
+            .and_modify(|leaf| leaf.active_layers.union_with(mask))
             .or_insert(ComponentLeaf {
                 path,
                 kind,
-                active_layers,
+                active_layers: mask,
             });
     }
 
     fn register_prefixes(&mut self, path: &ComponentPath, is_layer: bool) {
+        let target = if is_layer {
+            &mut self.layer_prefixes
+        } else {
+            &mut self.global_prefixes
+        };
         let mut accum = ComponentPath::new("");
         for seg in path.segments() {
             accum = accum.join(seg);
-            if is_layer {
-                self.layer_prefixes.insert(accum.clone());
-            } else {
-                self.global_prefixes.insert(accum.clone());
-            }
+            target.insert(accum.clone());
         }
     }
 
-    /// Checks whether `path` is a valid global node (either a leaf or a group prefix).
+    #[inline]
     pub fn is_valid_global_path(&self, path: &ComponentPath) -> bool {
         self.global_prefixes.contains(path)
     }
 
-    /// Checks whether `path` is a valid node under `hidden-layers` (either a leaf or a group prefix).
+    #[inline]
     pub fn is_valid_layer_path(&self, path: &ComponentPath) -> bool {
         self.layer_prefixes.contains(path)
     }
 
     /// Canonical superset tree containing all standard architectural modules from `docs/RU/config.md`.
-    ///
-    /// Used when inspecting a standalone config file before loading a concrete `.ltq` model,
-    /// or as a base template for preset architectures (`dense`, `moe`, `qwen3_next`, `qwen4_exp`, `gemma4`).
     pub fn canonical_superset(num_hidden_layers: usize) -> Self {
         Self::preset("canonical-superset", num_hidden_layers)
     }
@@ -614,68 +652,54 @@ impl ComponentTree {
     /// Builds a component tree for a named architecture preset (`"dense"`, `"moe"`, `"qwen3_next"`,
     /// `"qwen4_exp"`, `"gemma4"`, or `"canonical-superset"`).
     pub fn preset(preset: &str, num_hidden_layers: usize) -> Self {
-        let all_layers: Vec<usize> = (0..num_hidden_layers).collect();
+        let all = LayerMask::all(num_hidden_layers);
+        let none = LayerMask::EMPTY;
         let mut tree = Self::new(preset, num_hidden_layers);
 
-        // Global components
         tree.add_global("input-layer", ComponentKind::SparseWeight);
         tree.add_global("output-layer/norm", ComponentKind::DenseWeight);
         tree.add_global("output-layer/lm-head", ComponentKind::DenseWeight);
 
-        let is_moe = matches!(preset, "moe" | "qwen3_next" | "qwen4_exp" | "canonical-superset");
-        let has_ple = matches!(preset, "moe" | "qwen4_exp" | "gemma4" | "canonical-superset");
-        let has_vision = matches!(preset, "gemma4" | "canonical-superset");
-        let has_mtp = matches!(preset, "qwen3_next" | "qwen4_exp" | "canonical-superset");
-
-        if has_ple {
+        if matches!(preset, "moe" | "qwen4_exp" | "gemma4" | "canonical-superset") {
             tree.add_global("ple/table", ComponentKind::SparseWeight);
             tree.add_global("ple/projections", ComponentKind::DenseWeight);
         }
-        if has_vision {
+        if matches!(preset, "gemma4" | "canonical-superset") {
             tree.add_global("vision-tower", ComponentKind::DenseWeight);
             tree.add_global("audio-tower", ComponentKind::DenseWeight);
         }
-        if has_mtp {
+        if matches!(preset, "qwen3_next" | "qwen4_exp" | "canonical-superset") {
             tree.add_global("mtp", ComponentKind::DenseWeight);
         }
 
-        // Determine which layers have full/sparse attention vs linear attention (GDN)
-        let (attn_layers, gdn_layers): (Vec<usize>, Vec<usize>) = match preset {
-            "qwen3_next" | "qwen4_exp" => {
-                // 3:1 GDN : Attention hybrid ratio (every 4th layer is Attention: 3, 7, 11, ...)
-                let attn = (0..num_hidden_layers).filter(|l| (l + 1) % 4 == 0).collect();
-                let gdn = (0..num_hidden_layers).filter(|l| (l + 1) % 4 != 0).collect();
-                (attn, gdn)
-            }
-            "gemma4" => (all_layers.clone(), Vec::new()),
-            _ => (all_layers.clone(), all_layers.clone()),
+        let (attn_mask, gdn_mask) = match preset {
+            "qwen3_next" | "qwen4_exp" => (
+                LayerMask::from_fn(num_hidden_layers, |l| (l + 1) % 4 == 0),
+                LayerMask::from_fn(num_hidden_layers, |l| (l + 1) % 4 != 0),
+            ),
+            "gemma4" => (all, none),
+            _ => (all, all),
         };
 
-        // Layer norms
-        tree.add_layer("norms/input-norm", ComponentKind::DenseWeight, all_layers.clone());
-        tree.add_layer(
-            "norms/post-attention-norm",
-            ComponentKind::DenseWeight,
-            all_layers.clone(),
-        );
-
-        // Attention module
-        for sub in ["attention/q", "attention/k", "attention/v", "attention/o", "attention/qk-norm"] {
-            tree.add_layer(sub, ComponentKind::DenseWeight, attn_layers.clone());
+        for norm in ["norms/input-norm", "norms/post-attention-norm"] {
+            tree.add_layer(norm, ComponentKind::DenseWeight, all);
         }
-        tree.add_layer("attention/rope", ComponentKind::ComputeOnly, attn_layers.clone());
-        tree.add_layer("attention/kv-cache", ComponentKind::KvCache, attn_layers.clone());
+
+        for sub in ["attention/q", "attention/k", "attention/v", "attention/o", "attention/qk-norm"] {
+            tree.add_layer(sub, ComponentKind::DenseWeight, attn_mask);
+        }
+        tree.add_layer("attention/rope", ComponentKind::ComputeOnly, attn_mask);
+        tree.add_layer("attention/kv-cache", ComponentKind::KvCache, attn_mask);
         tree.add_layer(
             "attention/indexer/keys",
             ComponentKind::SparseWeight,
             if matches!(preset, "moe" | "qwen4_exp" | "canonical-superset") {
-                attn_layers.clone()
+                attn_mask
             } else {
-                Vec::new()
+                none
             },
         );
 
-        // Linear Attention (Gated DeltaNet) module
         for sub in [
             "linear-attention/projections/qkv",
             "linear-attention/projections/z",
@@ -687,51 +711,43 @@ impl ComponentTree {
             "linear-attention/conv",
             "linear-attention/norm",
         ] {
-            tree.add_layer(sub, ComponentKind::DenseWeight, gdn_layers.clone());
+            tree.add_layer(sub, ComponentKind::DenseWeight, gdn_mask);
         }
-        tree.add_layer(
-            "linear-attention/state",
-            ComponentKind::RecurrentState,
-            gdn_layers,
-        );
+        tree.add_layer("linear-attention/state", ComponentKind::RecurrentState, gdn_mask);
 
-        // Hyper-Connections module
-        if matches!(preset, "qwen4_exp" | "canonical-superset") {
-            tree.add_layer(
-                "hyper-connections",
-                ComponentKind::DenseWeight,
-                all_layers.clone(),
-            );
+        let hc_mask = if matches!(preset, "qwen4_exp" | "canonical-superset") {
+            all
         } else {
-            tree.add_layer("hyper-connections", ComponentKind::DenseWeight, Vec::new());
-        }
+            none
+        };
+        tree.add_layer("hyper-connections", ComponentKind::DenseWeight, hc_mask);
 
-        // Dense MLP vs MoE
-        let dense_layers = if matches!(preset, "dense" | "gemma4" | "canonical-superset") {
-            all_layers.clone()
+        let dense_mask = if matches!(preset, "dense" | "gemma4" | "canonical-superset") {
+            all
         } else {
-            Vec::new()
+            none
         };
         for sub in ["dense-mlp/gate", "dense-mlp/up", "dense-mlp/down"] {
-            tree.add_layer(sub, ComponentKind::DenseWeight, dense_layers.clone());
+            tree.add_layer(sub, ComponentKind::DenseWeight, dense_mask);
         }
 
-        let moe_layers = if is_moe { all_layers } else { Vec::new() };
-        tree.add_layer("moe/router", ComponentKind::DenseWeight, moe_layers.clone());
-        tree.add_layer(
-            "moe/shared-experts/gate",
-            ComponentKind::DenseWeight,
-            moe_layers.clone(),
-        );
+        let moe_mask = if matches!(preset, "moe" | "qwen3_next" | "qwen4_exp" | "canonical-superset")
+        {
+            all
+        } else {
+            none
+        };
+        tree.add_layer("moe/router", ComponentKind::DenseWeight, moe_mask);
+        tree.add_layer("moe/shared-experts/gate", ComponentKind::DenseWeight, moe_mask);
         tree.add_layer(
             "moe/shared-experts/projections",
             ComponentKind::DenseWeight,
-            moe_layers.clone(),
+            moe_mask,
         );
         tree.add_layer(
             "moe/routed-experts/projections",
             ComponentKind::SparseWeight,
-            moe_layers,
+            moe_mask,
         );
 
         tree
@@ -757,37 +773,30 @@ mod tests {
 
     #[test]
     fn test_access_mode_matrix() {
-        // VRAM -> GPU = Direct
         assert_eq!(
             AccessMode::resolve(MemLoc::Vram(0), Device::Cuda(0), false),
             AccessMode::Direct
         );
-        // VRAM -> CPU = Readback
         assert_eq!(
             AccessMode::resolve(MemLoc::Vram(0), Device::Cpu(0), false),
             AccessMode::Readback
         );
-        // RAM -> CPU = Direct
         assert_eq!(
             AccessMode::resolve(MemLoc::Ram(0), Device::Cpu(0), true),
             AccessMode::Direct
         );
-        // RAM -> GPU (full tensor) = Streamed
         assert_eq!(
             AccessMode::resolve(MemLoc::Ram(0), Device::Cuda(0), false),
             AccessMode::Streamed
         );
-        // RAM -> GPU (sparse row/page lookup) = ZeroCopy
         assert_eq!(
             AccessMode::resolve(MemLoc::Ram(0), Device::Cuda(0), true),
             AccessMode::ZeroCopy
         );
-        // Disk -> CPU = Fetch
         assert_eq!(
             AccessMode::resolve(MemLoc::Disk, Device::Cpu(0), true),
             AccessMode::Fetch
         );
-        // Disk -> GPU = FetchH2d
         assert_eq!(
             AccessMode::resolve(MemLoc::Disk, Device::Cuda(0), true),
             AccessMode::FetchH2d
@@ -801,15 +810,5 @@ mod tests {
         assert!(p.starts_with_path(&ComponentPath::new("moe/routed-experts")));
         assert!(p.starts_with_path(&ComponentPath::new("moe/routed-experts/projections")));
         assert!(!p.starts_with_path(&ComponentPath::new("moe/routed")));
-    }
-
-    #[test]
-    fn test_shape_and_dtype() {
-        let s = Shape::from([16, 256]);
-        assert_eq!(s.rank(), 2);
-        assert_eq!(s.numel(), 4096);
-        assert_eq!(s.byte_len(DType::BF16), 8192);
-        assert_eq!(s.contiguous_strides(), vec![256, 1]);
-        assert_eq!(s.to_string(), "[16, 256]");
     }
 }
