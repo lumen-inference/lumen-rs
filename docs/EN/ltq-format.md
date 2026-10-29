@@ -159,8 +159,10 @@ Offset    Size    Description
 0         4       Magic bytes "LTQ\0"
 4         4       u32: container version (1)
 8         8       u64: JSON header length H in bytes
-16        H       UTF-8 JSON header padded with spaces to a multiple of 4096 bytes
-16 + H    ...     Tensor payload area (64-byte aligned; 4096-byte aligned for RowTables)
+16        H       UTF-8 JSON header padded with spaces so that 16 + H is a multiple of 4096
+16 + H    ...     Tensor payload area, starts on a 4096-byte boundary. Tensor offsets are relative
+                  to its start: 64-byte aligned (4096-byte aligned for RowTable data), so they are
+                  aligned in the file and in an mmap of it as well
 ```
 
 JSON header schema:

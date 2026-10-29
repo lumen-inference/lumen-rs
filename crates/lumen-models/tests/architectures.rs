@@ -169,6 +169,55 @@ fn qwen3_next_uses_fused_projections_and_moe_with_shared_expert() {
     );
 }
 
+fn kv_kind(t: &ComponentTree) -> ComponentKind {
+    t.layer_leaves[&ComponentPath::new("attention/kv-cache")].kind
+}
+
+#[test]
+fn only_qsa_models_have_a_sparse_kv_cache() {
+    for (name, config) in all_samples() {
+        let t = tree(config);
+        let expected = if name == "qwen4_exp" {
+            ComponentKind::SparseKvCache
+        } else {
+            ComponentKind::KvCache
+        };
+        if t.layer_leaves
+            .contains_key(&ComponentPath::new("attention/kv-cache"))
+        {
+            assert_eq!(kv_kind(&t), expected, "{name}");
+        }
+    }
+}
+
+#[test]
+fn mixed_dense_and_sparse_kv_caches_are_rejected() {
+    use lumen_models::{AttentionSpec, Ffn, LayerSpec, Layout, Mixer};
+    let layer = |indexer| LayerSpec {
+        mixer: Mixer::Attention(AttentionSpec {
+            indexer,
+            ..AttentionSpec::standard(false)
+        }),
+        ffn: Ffn::Dense,
+    };
+    let layout = |layers| Layout {
+        name: "t".into(),
+        layers,
+        hyper_connections: false,
+        ple: false,
+        vision_tower: false,
+        audio_tower: false,
+        mtp: false,
+    };
+    assert!(layout(vec![layer(true), layer(true)]).validate().is_ok());
+    assert!(layout(vec![layer(false), layer(false)]).validate().is_ok());
+    let err = layout(vec![layer(true), layer(false)])
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("mixed dense/sparse"), "{err}");
+}
+
 #[test]
 fn qwen4_exp_adds_qsa_hyper_connections_and_ngram_table() {
     let t = tree(qwen4_exp_48());
@@ -322,7 +371,9 @@ fn every_component_of_every_family_is_in_the_known_namespace_with_the_same_kind(
                 .layer_leaves
                 .get(path)
                 .unwrap_or_else(|| panic!("{name}: {path} unknown"));
-            assert_eq!(k.kind, leaf.kind, "{name}: kind of {path}");
+            // The KV cache is dense or sparse depending on the family; every other kind is fixed.
+            let same = k.kind == leaf.kind || (k.kind.is_kv_cache() && leaf.kind.is_kv_cache());
+            assert!(same, "{name}: kind of {path}");
             assert!(
                 !leaf.active_layers.is_empty(),
                 "{name}: {path} registered but never active"
@@ -445,9 +496,16 @@ fn example_moe_resolves_on_qwen4_exp() {
     let l32 = plan.layers[32][&experts];
     assert_eq!((l32.compute, l32.store), (Device::Cuda(0), MemLoc::Vram(0)));
 
-    // KV cache and indexer keys live in RAM on the full-attention layers.
+    // KV cache and indexer keys live in RAM on the full-attention layers. QSA gathers only the
+    // selected blocks, so the GPU reads them straight over PCIe.
     assert_eq!(plan.kv.len(), 12);
     assert!(plan.kv.iter().all(|k| k.place.store == MemLoc::Ram(0)));
+    let kv = ComponentPath::new("attention/kv-cache");
+    let kind = ComponentKind::SparseKvCache;
+    assert_eq!(
+        plan.layers[3][&kv].decode_access_mode(kind),
+        AccessMode::ZeroCopy
+    );
     let keys = ComponentPath::new("attention/indexer/keys");
     assert_eq!(plan.layers[3][&keys].store, MemLoc::Ram(0));
     assert!(

@@ -596,9 +596,15 @@ pub enum ComponentKind {
     /// Bank of routed experts (`ExpertBank`). Decode reads only the selected `top-k` experts;
     /// during prefill a chunk touches (almost) all of them, so it is read in full.
     ExpertBank,
-    /// Paged attention KV cache (`KvPool`).
+    /// Paged attention KV cache (`KvPool`) of ordinary attention. Every decode step reads all of
+    /// it (the whole context, or the whole window for sliding-window layers), so it is a dense
+    /// access like a weight matrix.
     KvCache,
-    /// Compact per-token key cache scanned by the sparse-attention indexer; read like `KvCache`.
+    /// KV cache of a sparse-attention (`QSA`) layer: the indexer selects a bounded set of blocks
+    /// per query, so only those blocks are read (gathered).
+    SparseKvCache,
+    /// Compact per-token key cache scanned by the sparse-attention indexer. Read over PCIe
+    /// directly by the kernel (`ZeroCopy`), as specified in `docs/EN/architecture.md` Section 3.
     IndexerCache,
     /// Recurrent linear-attention or PLE state (`StatePool`).
     RecurrentState,
@@ -612,14 +618,23 @@ impl ComponentKind {
     pub const fn sparse_in_decode(self) -> bool {
         matches!(
             self,
-            Self::RowTable | Self::ExpertBank | Self::KvCache | Self::IndexerCache
+            Self::RowTable | Self::ExpertBank | Self::SparseKvCache | Self::IndexerCache
         )
     }
 
     /// Whether a prefill step reads only a sparse subset of rows/blocks.
     #[inline]
     pub const fn sparse_in_prefill(self) -> bool {
-        matches!(self, Self::RowTable | Self::KvCache | Self::IndexerCache)
+        matches!(
+            self,
+            Self::RowTable | Self::SparseKvCache | Self::IndexerCache
+        )
+    }
+
+    /// Whether this is a per-layer attention KV cache (dense or sparse).
+    #[inline]
+    pub const fn is_kv_cache(self) -> bool {
+        matches!(self, Self::KvCache | Self::SparseKvCache)
     }
 }
 
@@ -840,5 +855,11 @@ mod tests {
         assert!(ComponentKind::ExpertBank.sparse_in_decode());
         assert!(!ComponentKind::ExpertBank.sparse_in_prefill());
         assert!(!ComponentKind::DenseWeight.sparse_in_decode());
+        // Ordinary attention reads the whole KV cache every step; only QSA gathers blocks.
+        assert!(!ComponentKind::KvCache.sparse_in_decode());
+        assert!(!ComponentKind::KvCache.sparse_in_prefill());
+        assert!(ComponentKind::SparseKvCache.sparse_in_decode());
+        assert!(ComponentKind::KvCache.is_kv_cache() && ComponentKind::SparseKvCache.is_kv_cache());
+        assert!(!ComponentKind::IndexerCache.is_kv_cache());
     }
 }

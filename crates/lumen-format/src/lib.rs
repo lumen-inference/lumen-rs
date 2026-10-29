@@ -4,8 +4,12 @@
 //! - `0..4`:   Magic signature `"LTQ\0"`
 //! - `4..8`:   `u32` container version (`1`)
 //! - `8..16`:  `u64` JSON header byte length `H`
-//! - `16..16+H`: UTF-8 JSON header padded with spaces (`0x20`) so that `H` is a multiple of 4096
-//! - `16+H..`: Tensor payload area; tensor `offset`s are relative to its start
+//! - `16..16+H`: UTF-8 JSON header padded with spaces (`0x20`) so that `16 + H` is a multiple of 4096
+//! - `16+H..`: Tensor payload area, starting on a 4096-byte boundary; tensor `offset`s are relative
+//!   to its start and 64-byte aligned (4096 for row-table data), which makes them aligned in the
+//!   file (and in the `mmap`) as well
+//!
+//! This matches the reference writer/reader in `experements/src/ltq_file.py`.
 //!
 //! The header is untrusted input: every size, offset and index it contains is validated before
 //! any other crate sees it. This crate has no knowledge of model architectures.
@@ -35,8 +39,14 @@ pub const LTQ_QUANT_VERSION: u32 = 1;
 /// Length of the binary preamble (magic + version + header length).
 pub const LTQ_PREAMBLE_LEN: usize = 16;
 
-/// The JSON header length `H` is padded to a multiple of this many bytes.
+/// The tensor payload starts at file offset `16 + H`, which is a multiple of this many bytes.
 pub const LTQ_HEADER_ALIGN: usize = 4096;
+
+/// Alignment of every tensor offset (relative to the payload start, hence also absolute).
+pub const LTQ_TENSOR_ALIGN: u64 = 64;
+
+/// Alignment of the data of a row table (`{p}.ltq_rows.data`), for page-granular disk reads.
+pub const LTQ_ROW_TABLE_ALIGN: u64 = 4096;
 
 /// Metadata for a single `RowTable` compressed with `LtqRing` in `quantization.row_tables`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -129,6 +139,8 @@ pub struct LtqHeader {
     pub chat_template: Option<String>,
     #[serde(default)]
     pub processor_config: Value,
+    #[serde(default)]
+    pub video_processor_config: Value,
     pub quantization: LtqQuantizationMeta,
     pub tensors: BTreeMap<String, LtqTensorEntry>,
 }
@@ -166,11 +178,31 @@ impl LtqHeader {
         Ok(())
     }
 
-    /// Checks that every tensor lies inside a payload of `payload_len` bytes and that no two
-    /// non-empty tensors overlap.
+    /// Checks that every tensor lies inside a payload of `payload_len` bytes, is aligned
+    /// (64 bytes; 4096 for row-table data) and that no two non-empty tensors overlap.
+    ///
+    /// Offsets are relative to the payload start, which is itself 4096-byte aligned, so relative
+    /// alignment is absolute alignment.
     pub fn validate_tensor_layout(&self, payload_len: u64) -> Result<()> {
+        let row_table_data: Vec<String> = self
+            .quantization
+            .row_tables
+            .keys()
+            .map(|p| format!("{p}.ltq_rows.data"))
+            .collect();
         let mut ranges = Vec::with_capacity(self.tensors.len());
         for (name, entry) in &self.tensors {
+            let align = if row_table_data.contains(name) {
+                LTQ_ROW_TABLE_ALIGN
+            } else {
+                LTQ_TENSOR_ALIGN
+            };
+            if entry.offset % align != 0 {
+                return Err(LumenError::Format(format!(
+                    "tensor '{name}' offset {} is not {align}-byte aligned",
+                    entry.offset
+                )));
+            }
             let len = entry
                 .byte_len()
                 .map_err(|e| LumenError::Format(format!("tensor '{name}': {e}")))?;
@@ -202,19 +234,21 @@ impl LtqHeader {
     }
 
     /// Serializes this header into a `.ltq` prefix: the 16-byte binary preamble followed by the
-    /// JSON padded with spaces so that its length `H` is a multiple of [`LTQ_HEADER_ALIGN`].
+    /// JSON padded with spaces so that `16 + H` is a multiple of [`LTQ_HEADER_ALIGN`]; the tensor
+    /// payload may start right after.
     pub fn to_padded_header_bytes(&self) -> Result<Vec<u8>> {
         let mut json_bytes = serde_json::to_vec(self)
             .map_err(|e| LumenError::Format(format!("failed to serialize LTQ header: {e}")))?;
-        let padded_len = json_bytes.len().div_ceil(LTQ_HEADER_ALIGN) * LTQ_HEADER_ALIGN;
-        json_bytes.resize(padded_len.max(LTQ_HEADER_ALIGN), b' ');
+        let total =
+            (LTQ_PREAMBLE_LEN + json_bytes.len()).div_ceil(LTQ_HEADER_ALIGN) * LTQ_HEADER_ALIGN;
+        json_bytes.resize(total - LTQ_PREAMBLE_LEN, b' ');
 
         let mut out = Vec::with_capacity(LTQ_PREAMBLE_LEN + json_bytes.len());
         out.extend_from_slice(&LTQ_MAGIC);
         out.extend_from_slice(&LTQ_CONTAINER_VERSION.to_le_bytes());
         out.extend_from_slice(&(json_bytes.len() as u64).to_le_bytes());
         out.extend_from_slice(&json_bytes);
-        debug_assert_eq!((out.len() - LTQ_PREAMBLE_LEN) % LTQ_HEADER_ALIGN, 0);
+        debug_assert_eq!(out.len() % LTQ_HEADER_ALIGN, 0);
         Ok(out)
     }
 }
@@ -242,14 +276,14 @@ pub fn parse_ltq_header_from_slice(bytes: &[u8]) -> Result<(LtqHeader, usize)> {
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8-byte slice"));
     let header_len = usize::try_from(header_len)
         .map_err(|_| LumenError::Format(format!("header length {header_len} too large")))?;
-    if header_len == 0 || header_len % LTQ_HEADER_ALIGN != 0 {
-        return Err(LumenError::Format(format!(
-            "JSON header length {header_len} must be a non-zero multiple of {LTQ_HEADER_ALIGN}"
-        )));
-    }
     let data_offset = LTQ_PREAMBLE_LEN.checked_add(header_len).ok_or_else(|| {
         LumenError::Format("overflow computing .ltq header end offset".to_string())
     })?;
+    if header_len == 0 || data_offset % LTQ_HEADER_ALIGN != 0 {
+        return Err(LumenError::Format(format!(
+            "16 + JSON header length ({data_offset}) must be a non-zero multiple of {LTQ_HEADER_ALIGN}"
+        )));
+    }
     if bytes.len() < data_offset {
         return Err(LumenError::Format(format!(
             ".ltq file truncated: header specifies {header_len} bytes, file has {}",
@@ -346,6 +380,7 @@ mod tests {
             tokenizer_config: Value::Null,
             chat_template: Some("{{ messages }}".to_string()),
             processor_config: Value::Null,
+            video_processor_config: Value::Null,
             quantization: LtqQuantizationMeta {
                 quant_method: "ltq".to_string(),
                 version: 1,
@@ -371,33 +406,101 @@ mod tests {
         let header = test_header();
         let bytes = file_with_payload(&header, 256);
 
-        // Spec: the JSON header length H is a multiple of 4096; data starts at 16 + H.
-        let h_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        assert_eq!(h_len % 4096, 0);
+        // 16 + H is a multiple of 4096: the payload starts on a page boundary.
+        let h_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        assert_eq!((16 + h_len) % 4096, 0);
         let (parsed, data_offset) = parse_ltq_header_from_slice(&bytes).unwrap();
-        assert_eq!(data_offset, 16 + h_len as usize);
+        assert_eq!(data_offset, 16 + h_len);
+        assert_eq!(data_offset, 4096);
         assert_eq!(parsed.quantization.formats[0].name, "TCQ3X");
         assert_eq!(parsed.tensors["model.norm.weight"].byte_len().unwrap(), 256);
     }
 
     #[test]
-    fn test_large_header_pads_to_next_multiple() {
+    fn test_large_header_pads_to_next_page() {
         let mut header = test_header();
         header.chat_template = Some("x".repeat(10_000));
         let bytes = file_with_payload(&header, 256);
-        let h_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        assert_eq!(h_len, 12_288);
+        let h_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        assert_eq!(16 + h_len, 12_288);
         parse_ltq_header_from_slice(&bytes).unwrap();
     }
 
+    /// The layout produced by the reference writer (`experements/src/ltq_file.py`): `H` is a
+    /// "reserve" with `(16 + H) % 4096 == 0` and the JSON is space-padded to exactly `H` bytes.
     #[test]
-    fn test_rejects_header_length_not_multiple_of_4096() {
+    fn test_reads_the_layout_of_the_reference_writer() {
+        let json = serde_json::to_vec(&test_header()).unwrap();
+        let reserve = 4096 * 3 - 16;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"LTQ\0");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(reserve as u64).to_le_bytes());
+        bytes.extend_from_slice(&json);
+        bytes.resize(16 + reserve, b' ');
+        bytes.resize(16 + reserve + 256, 0);
+        let (_, data_offset) = parse_ltq_header_from_slice(&bytes).unwrap();
+        assert_eq!(data_offset, 4096 * 3);
+    }
+
+    #[test]
+    fn test_rejects_payload_not_starting_on_a_page_boundary() {
         let mut bytes = file_with_payload(&test_header(), 256);
-        // Pretend the JSON is one byte shorter: no longer a multiple of 4096.
-        bytes[8..16].copy_from_slice(&4095u64.to_le_bytes());
+        // H = 4096 would put the payload at 4112.
+        bytes[8..16].copy_from_slice(&4096u64.to_le_bytes());
         assert!(parse_ltq_header_from_slice(&bytes).is_err());
         bytes[8..16].copy_from_slice(&0u64.to_le_bytes());
         assert!(parse_ltq_header_from_slice(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_unknown_header_sections_are_tolerated_and_known_ones_kept() {
+        // The reference writer also stores `video_processor_config`.
+        let mut v = serde_json::to_value(test_header()).unwrap();
+        v["video_processor_config"] = serde_json::json!({ "fps": 2 });
+        v["some_future_section"] = serde_json::json!(1);
+        let h: LtqHeader = serde_json::from_value(v).unwrap();
+        assert_eq!(h.video_processor_config["fps"], 2);
+    }
+
+    #[test]
+    fn test_tensor_alignment_is_enforced() {
+        let mut header = test_header();
+        header.tensors.get_mut("model.norm.weight").unwrap().offset = 32;
+        let err = header
+            .validate_tensor_layout(1 << 20)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("64-byte aligned"), "{err}");
+        header.tensors.get_mut("model.norm.weight").unwrap().offset = 64;
+        header.validate_tensor_layout(1 << 20).unwrap();
+
+        // Row-table data must be page aligned.
+        header.quantization.row_tables.insert(
+            "ple".into(),
+            LtqRowTableMeta {
+                format: 0,
+                ring: 160,
+                hadamard: 32,
+            },
+        );
+        let rows = |offset| LtqTensorEntry {
+            dtype: DType::U8,
+            shape: Shape::from([100]),
+            offset,
+        };
+        header
+            .tensors
+            .insert("ple.ltq_rows.data".into(), rows(4096 + 64));
+        let err = header
+            .validate_tensor_layout(1 << 20)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("4096-byte aligned"), "{err}");
+        header
+            .tensors
+            .insert("ple.ltq_rows.data".into(), rows(8192));
+        header.validate_tensor_layout(1 << 20).unwrap();
     }
 
     #[test]
@@ -448,25 +551,26 @@ mod tests {
         };
         let mut header = test_header();
         header.tensors.insert("a".into(), entry(0));
-        header.tensors.insert("b".into(), entry(100));
+        header.tensors.insert("b".into(), entry(128));
         header.tensors.remove("model.norm.weight");
-        header.validate_tensor_layout(200).unwrap();
+        header.validate_tensor_layout(256).unwrap();
 
-        header.tensors.insert("b".into(), entry(99));
-        let err = header.validate_tensor_layout(200).unwrap_err().to_string();
+        // 100 bytes at offset 0 and at 64 overlap.
+        header.tensors.insert("b".into(), entry(64));
+        let err = header.validate_tensor_layout(256).unwrap_err().to_string();
         assert!(err.contains("overlap"), "{err}");
 
-        // Empty tensors may sit anywhere.
-        header.tensors.insert("b".into(), entry(100));
+        // Empty tensors never overlap anything.
+        header.tensors.insert("b".into(), entry(128));
         header.tensors.insert(
             "empty".into(),
             LtqTensorEntry {
                 dtype: DType::U8,
                 shape: Shape::from([0]),
-                offset: 50,
+                offset: 64,
             },
         );
-        header.validate_tensor_layout(200).unwrap();
+        header.validate_tensor_layout(256).unwrap();
     }
 
     #[test]

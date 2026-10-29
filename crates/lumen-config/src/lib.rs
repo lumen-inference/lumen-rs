@@ -937,7 +937,7 @@ impl RuntimeConfig {
                 }
 
                 let (place, origin) = finalize_place(resolved);
-                if leaf.kind == ComponentKind::KvCache {
+                if leaf.kind.is_kv_cache() {
                     kv.push(KvPlacement {
                         layer: layer_idx,
                         place,
@@ -1557,6 +1557,30 @@ mod tests {
 
     fn cfg_min() -> RuntimeConfig {
         RuntimeConfig::from_json_str(MIN).unwrap()
+    }
+
+    #[test]
+    fn test_dense_kv_cache_in_ram_is_streamed_while_sparse_kv_cache_is_gathered() {
+        // Ordinary attention reads the whole cache each step: no gather is possible, so a cache
+        // kept in RAM is streamed to the GPU (which is why it normally belongs in VRAM).
+        let cfg = cfg(r#""hidden-layers": { "attention": { "kv-cache": { "store": "ram:0" } } }"#);
+        let plan = cfg
+            .resolve_plan(Shape::dense(4).tree(), &known(), true)
+            .unwrap();
+        let kv = plan.layers[0][&ComponentPath::new("attention/kv-cache")];
+        assert_eq!(
+            kv.decode_access_mode(ComponentKind::KvCache),
+            AccessMode::Streamed
+        );
+        // With a sparse indexer only selected blocks are touched: read them over PCIe directly.
+        assert_eq!(
+            kv.decode_access_mode(ComponentKind::SparseKvCache),
+            AccessMode::ZeroCopy
+        );
+        assert_eq!(
+            kv.prefill_access_mode(ComponentKind::SparseKvCache),
+            AccessMode::ZeroCopy
+        );
     }
 
     #[test]
