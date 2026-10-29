@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 lumen-core.workspace = true
 lumen-config.workspace = true
+lumen-models.workspace = true
 lumen-format.workspace = true
 lumen-engine.workspace = true
 lumen-quantize.workspace = true
@@ -24,3 +25,9 @@ serde_json.workspace = true
 default = ["server"]
 cuda = ["lumen-engine/cuda"]
 server = ["dep:lumen-server"]
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

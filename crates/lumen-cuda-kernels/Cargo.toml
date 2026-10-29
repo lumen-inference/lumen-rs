@@ -9,3 +9,6 @@ rust-version.workspace = true
 # build.rs (nvcc, CUTLASS and FlashInfer submodules, bindgen over cuda.h) is added together with the first kernel.
 [dependencies]
 lumen-kabi.workspace = true
+
+[lints]
+workspace = true

@@ -31,8 +31,7 @@ impl Place {
     /// Access mode during decode for a component of the given `ComponentKind`.
     #[inline]
     pub const fn decode_access_mode(&self, kind: ComponentKind) -> AccessMode {
-        let sparse = matches!(kind, ComponentKind::SparseWeight | ComponentKind::KvCache);
-        AccessMode::resolve(self.store, self.compute, sparse)
+        AccessMode::resolve(self.store, self.compute, kind.sparse_in_decode())
     }
 
     /// Effective compute device during prefill.
@@ -47,12 +46,11 @@ impl Place {
     /// Access mode during prefill for a component of the given `ComponentKind`.
     #[inline]
     pub const fn prefill_access_mode(&self, kind: ComponentKind) -> AccessMode {
-        let sparse = if self.prefill_compute.is_some() {
-            false
-        } else {
-            matches!(kind, ComponentKind::SparseWeight | ComponentKind::KvCache)
-        };
-        AccessMode::resolve(self.store, self.effective_prefill_compute(), sparse)
+        AccessMode::resolve(
+            self.store,
+            self.effective_prefill_compute(),
+            kind.sparse_in_prefill(),
+        )
     }
 }
 
@@ -90,7 +88,10 @@ impl PlaceOrigin {
                 _ => self.compute_source.clone(),
             }
         } else {
-            format!("compute: {}, store: {}", self.compute_source, self.store_source)
+            format!(
+                "compute: {}, store: {}",
+                self.compute_source, self.store_source
+            )
         }
     }
 }
@@ -128,6 +129,11 @@ pub struct SamplingConfig {
     pub min_p: f32,
 }
 
+impl SamplingConfig {
+    /// Keys accepted in `model.sampling` (kept next to the fields; a test checks they agree).
+    pub const KEYS: &'static [&'static str] = &["temperature", "top-p", "top-k", "min-p"];
+}
+
 impl Default for SamplingConfig {
     fn default() -> Self {
         Self {
@@ -145,10 +151,18 @@ pub struct ChatTemplateConfig {
     pub kwargs: BTreeMap<String, Value>,
 }
 
+impl ChatTemplateConfig {
+    pub const KEYS: &'static [&'static str] = &["kwargs"];
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct ContextConfig {
     pub size: usize,
+}
+
+impl ContextConfig {
+    pub const KEYS: &'static [&'static str] = &["size"];
 }
 
 impl Default for ContextConfig {
@@ -164,11 +178,19 @@ pub struct KvQuantizationConfig {
     pub v_bits: u8,
 }
 
+impl KvQuantizationConfig {
+    pub const KEYS: &'static [&'static str] = &["k-bits", "v-bits"];
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct CudaRuntimeConfig {
     pub prefill_chunk_size: usize,
     pub cuda_graphs: bool,
+}
+
+impl CudaRuntimeConfig {
+    pub const KEYS: &'static [&'static str] = &["prefill-chunk-size", "cuda-graphs"];
 }
 
 impl Default for CudaRuntimeConfig {
@@ -188,6 +210,10 @@ pub struct CpuRuntimeConfig {
     pub numa_spread: bool,
 }
 
+impl CpuRuntimeConfig {
+    pub const KEYS: &'static [&'static str] = &["threads", "reserve-cores", "numa-spread"];
+}
+
 impl Default for CpuRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -203,6 +229,10 @@ impl Default for CpuRuntimeConfig {
 pub struct DiskRuntimeConfig {
     pub io_threads: usize,
     pub mlock: bool,
+}
+
+impl DiskRuntimeConfig {
+    pub const KEYS: &'static [&'static str] = &["io-threads", "mlock"];
 }
 
 impl Default for DiskRuntimeConfig {
@@ -222,12 +252,45 @@ pub struct ServerRuntimeConfig {
     pub max_concurrent_requests: usize,
 }
 
+impl ServerRuntimeConfig {
+    pub const KEYS: &'static [&'static str] = &["host", "port", "max-concurrent-requests"];
+}
+
 impl Default for ServerRuntimeConfig {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".to_string(),
             port: 8080,
             max_concurrent_requests: 1,
+        }
+    }
+}
+
+/// Attention implementation selected by `attention-mechanism`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttentionMechanism {
+    #[default]
+    FlashAttention,
+}
+
+impl AttentionMechanism {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FlashAttention => "flash-attention",
+        }
+    }
+}
+
+impl std::str::FromStr for AttentionMechanism {
+    type Err = LumenError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "flash-attention" => Ok(Self::FlashAttention),
+            other => Err(LumenError::Config(format!(
+                "unknown attention-mechanism '{other}' (supported: 'flash-attention')"
+            ))),
         }
     }
 }
@@ -244,7 +307,7 @@ pub struct RuntimeConfig {
     pub cpu: CpuRuntimeConfig,
     pub disk: DiskRuntimeConfig,
     pub server: ServerRuntimeConfig,
-    pub attention_mechanism: String,
+    pub attention_mechanism: AttentionMechanism,
     raw_model: Map<String, Value>,
 }
 
@@ -322,9 +385,63 @@ impl LayerSelector {
         })
     }
 
+    /// Every layer index of the selector. Unbounded for huge ranges: prefer
+    /// [`Self::layers_within`] or work on [`Self::ranges`] directly.
     pub fn layers(&self) -> impl Iterator<Item = usize> + '_ {
         self.ranges.iter().flat_map(|&(s, e)| s..=e)
     }
+
+    /// The layer indices of the selector that exist in a model with `num_layers` layers.
+    pub fn layers_within(&self, num_layers: usize) -> impl Iterator<Item = usize> + '_ {
+        self.ranges
+            .iter()
+            .filter(move |&&(s, _)| s < num_layers)
+            .flat_map(move |&(s, e)| s..=e.min(num_layers - 1))
+    }
+
+    /// The parts of the selector at or beyond `num_layers`, as inclusive ranges.
+    pub fn out_of_range(&self, num_layers: usize) -> Vec<(usize, usize)> {
+        self.ranges
+            .iter()
+            .filter(|&&(_, e)| e >= num_layers)
+            .map(|&(s, e)| (s.max(num_layers), e))
+            .collect()
+    }
+}
+
+/// Fails if any two layer ranges (of the same or of different selectors) share a layer.
+fn check_selector_overlaps(selectors: &[(LayerSelector, &Value)]) -> Result<()> {
+    let mut spans: Vec<(usize, usize, &str)> = selectors
+        .iter()
+        .flat_map(|(sel, _)| sel.ranges.iter().map(|&(s, e)| (s, e, sel.raw.as_str())))
+        .collect();
+    spans.sort_unstable();
+    // Sorted by start: if some span overlaps a later one, it also overlaps its successor.
+    for pair in spans.windows(2) {
+        let (_, prev_end, prev_raw) = pair[0];
+        let (start, _, raw) = pair[1];
+        if start <= prev_end {
+            return Err(LumenError::Config(format!(
+                "overlapping layer selectors '{prev_raw}' and '{raw}' both match layer {start}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `[(0, 3), (7, 7)]` -> `"0-3, 7"`.
+fn format_ranges(ranges: &[(usize, usize)]) -> String {
+    ranges
+        .iter()
+        .map(|&(s, e)| {
+            if s == e {
+                s.to_string()
+            } else {
+                format!("{s}-{e}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ============================================================================
@@ -386,7 +503,10 @@ fn edit_distance(a: &str, b: &str) -> usize {
     usize::from(prev1[n])
 }
 
-fn suggest_key<'a>(unknown: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+fn suggest_key<'a>(
+    unknown: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
     candidates
         .into_iter()
         .map(|cand| (cand, edit_distance(unknown, cand)))
@@ -426,6 +546,47 @@ fn parse_section<T: DeserializeOwned>(
     serde_json::from_value(v.clone())
         .map(Some)
         .map_err(|e| LumenError::Config(format!("invalid '{scope}': {e}")))
+}
+
+/// Range checks for the runtime sections (the JSON shape was already validated by serde).
+fn validate_runtime_sections(
+    sampling: &SamplingConfig,
+    cuda: &CudaRuntimeConfig,
+    disk: &DiskRuntimeConfig,
+    server: &ServerRuntimeConfig,
+) -> Result<()> {
+    let bad = |msg: String| Err(LumenError::Config(msg));
+    if !sampling.temperature.is_finite() || sampling.temperature < 0.0 {
+        return bad(format!(
+            "'model.sampling.temperature' must be finite and >= 0 (got {})",
+            sampling.temperature
+        ));
+    }
+    if !(sampling.top_p > 0.0 && sampling.top_p <= 1.0) {
+        return bad(format!(
+            "'model.sampling.top-p' must be in (0, 1] (got {})",
+            sampling.top_p
+        ));
+    }
+    if !(0.0..=1.0).contains(&sampling.min_p) {
+        return bad(format!(
+            "'model.sampling.min-p' must be in [0, 1] (got {})",
+            sampling.min_p
+        ));
+    }
+    if cuda.prefill_chunk_size == 0 {
+        return bad("'cuda.prefill-chunk-size' must be greater than 0".to_string());
+    }
+    if disk.io_threads == 0 {
+        return bad("'disk.io-threads' must be greater than 0".to_string());
+    }
+    if server.max_concurrent_requests == 0 {
+        return bad("'server.max-concurrent-requests' must be greater than 0".to_string());
+    }
+    if server.host.trim().is_empty() {
+        return bad("'server.host' must not be empty".to_string());
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -471,19 +632,20 @@ impl RuntimeConfig {
         let sampling = parse_section::<SamplingConfig>(
             model_obj.get("sampling"),
             "model.sampling",
-            &["temperature", "top-p", "top-k", "min-p"],
+            SamplingConfig::KEYS,
         )?
         .unwrap_or_default();
 
         let chat_template = parse_section::<ChatTemplateConfig>(
             root.get("chat-template"),
             "chat-template",
-            &["kwargs"],
+            ChatTemplateConfig::KEYS,
         )?
         .unwrap_or_default();
 
-        let context = parse_section::<ContextConfig>(root.get("context"), "context", &["size"])?
-            .unwrap_or_default();
+        let context =
+            parse_section::<ContextConfig>(root.get("context"), "context", ContextConfig::KEYS)?
+                .unwrap_or_default();
         if context.size == 0 {
             return Err(LumenError::Config(
                 "'context.size' must be greater than 0".to_string(),
@@ -493,7 +655,7 @@ impl RuntimeConfig {
         let kv_quantization = parse_section::<KvQuantizationConfig>(
             root.get("kv-quantization"),
             "kv-quantization",
-            &["k-bits", "v-bits"],
+            KvQuantizationConfig::KEYS,
         )?;
         if let Some(kvq) = kv_quantization
             && (!(2..=8).contains(&kvq.k_bits) || !(2..=8).contains(&kvq.v_bits))
@@ -504,28 +666,22 @@ impl RuntimeConfig {
             )));
         }
 
-        let cuda = parse_section::<CudaRuntimeConfig>(
-            root.get("cuda"),
-            "cuda",
-            &["prefill-chunk-size", "cuda-graphs"],
-        )?
-        .unwrap_or_default();
+        let cuda =
+            parse_section::<CudaRuntimeConfig>(root.get("cuda"), "cuda", CudaRuntimeConfig::KEYS)?
+                .unwrap_or_default();
 
-        let cpu = parse_section::<CpuRuntimeConfig>(
-            root.get("cpu"),
-            "cpu",
-            &["threads", "reserve-cores", "numa-spread"],
-        )?
-        .unwrap_or_default();
+        let cpu =
+            parse_section::<CpuRuntimeConfig>(root.get("cpu"), "cpu", CpuRuntimeConfig::KEYS)?
+                .unwrap_or_default();
 
         let disk =
-            parse_section::<DiskRuntimeConfig>(root.get("disk"), "disk", &["io-threads", "mlock"])?
+            parse_section::<DiskRuntimeConfig>(root.get("disk"), "disk", DiskRuntimeConfig::KEYS)?
                 .unwrap_or_default();
 
         let server = parse_section::<ServerRuntimeConfig>(
             root.get("server"),
             "server",
-            &["host", "port", "max-concurrent-requests"],
+            ServerRuntimeConfig::KEYS,
         )?
         .unwrap_or_default();
 
@@ -535,9 +691,11 @@ impl RuntimeConfig {
                 .ok_or_else(|| {
                     LumenError::Config("'attention-mechanism' must be a string".to_string())
                 })?
-                .to_string(),
-            None => "flash-attention".to_string(),
+                .parse()?,
+            None => AttentionMechanism::default(),
         };
+
+        validate_runtime_sections(&sampling, &cuda, &disk, &server)?;
 
         Ok(Self {
             model_path,
@@ -556,11 +714,23 @@ impl RuntimeConfig {
 
     /// Resolves the cascading configuration rules against the given `ComponentTree` into a
     /// validated, flat `PlacementPlan`.
-    pub fn resolve_plan(&self, tree: ComponentTree, strict: bool) -> Result<PlacementPlan> {
-        let superset = ComponentTree::canonical_superset(1);
+    ///
+    /// `known` is a tree containing *every* component path any supported architecture can have
+    /// (`lumen_models::known_components`). A rule for a path that exists in `known` but not in
+    /// `tree` (e.g. `moe` on a dense model) is skipped and recorded in
+    /// [`Provenance::skipped_rules`]; a path that is in neither is a typo and is rejected.
+    /// This keeps `lumen-config` free of any knowledge about concrete models.
+    pub fn resolve_plan(
+        &self,
+        tree: ComponentTree,
+        known: &ComponentTree,
+        strict: bool,
+    ) -> Result<PlacementPlan> {
+        let superset = known;
+        let num_layers = tree.num_hidden_layers;
         let mut provenance = Provenance {
             global_origins: BTreeMap::new(),
-            layer_origins: vec![BTreeMap::new(); tree.num_hidden_layers],
+            layer_origins: vec![BTreeMap::new(); num_layers],
             skipped_rules: Vec::new(),
             warnings: Vec::new(),
         };
@@ -593,7 +763,7 @@ impl RuntimeConfig {
                 &format!("model.{key}"),
                 false,
                 &tree,
-                &superset,
+                superset,
                 &mut global_rules,
                 &mut provenance.skipped_rules,
             )?;
@@ -611,8 +781,7 @@ impl RuntimeConfig {
         // 3. Collect general "hidden-layers" rules and layer-selector rules
         let mut general_layer_rules: BTreeMap<ComponentPath, PartialPlace> = BTreeMap::new();
         let mut selector_layer_rules: Vec<BTreeMap<ComponentPath, PartialPlace>> =
-            vec![BTreeMap::new(); tree.num_hidden_layers];
-        let mut layer_claimed_by: BTreeMap<usize, String> = BTreeMap::new();
+            vec![BTreeMap::new(); num_layers];
 
         if let Some(hl_val) = self.raw_model.get("hidden-layers") {
             let hl_obj = hl_val.as_object().ok_or_else(|| {
@@ -635,74 +804,15 @@ impl RuntimeConfig {
                 .chain(PLACEMENT_KEYS.iter().copied())
                 .collect();
 
+            // Parse every selector first: overlaps are decided on the ranges themselves, so the
+            // cost never depends on how large the numbers in the config are.
+            let mut selectors: Vec<(LayerSelector, &Value)> = Vec::new();
             for (key, val) in hl_obj {
                 if PLACEMENT_KEYS.contains(&key.as_str()) {
                     continue;
                 }
                 if LayerSelector::looks_like_selector(key) {
-                    let selector = LayerSelector::parse(key)?;
-                    let mut out_of_range = Vec::new();
-                    let mut in_range = Vec::new();
-
-                    for layer_idx in selector.layers() {
-                        if let Some(prev_sel) =
-                            layer_claimed_by.insert(layer_idx, selector.raw.clone())
-                        {
-                            return Err(LumenError::Config(format!(
-                                "overlapping layer selectors '{}' and '{}' both match layer {}",
-                                prev_sel, selector.raw, layer_idx
-                            )));
-                        }
-                        if layer_idx >= tree.num_hidden_layers {
-                            out_of_range.push(layer_idx);
-                        } else {
-                            in_range.push(layer_idx);
-                        }
-                    }
-
-                    if !out_of_range.is_empty() {
-                        let msg = format!(
-                            "layer selector '{}' references layers {:?} outside model range [0, {})",
-                            selector.raw, out_of_range, tree.num_hidden_layers
-                        );
-                        if strict {
-                            return Err(LumenError::Config(msg));
-                        }
-                        provenance.warnings.push(msg);
-                    }
-
-                    let sel_origin = format!("hidden-layers[\"{}\"]", selector.raw);
-                    let mut parsed_sel_rules: BTreeMap<ComponentPath, PartialPlace> =
-                        BTreeMap::new();
-                    collect_subtree_rules(
-                        val,
-                        &ComponentPath::new(""),
-                        &sel_origin,
-                        true,
-                        &tree,
-                        &superset,
-                        &mut parsed_sel_rules,
-                        &mut provenance.skipped_rules,
-                    )?;
-
-                    for layer_idx in in_range {
-                        for (p, r) in &parsed_sel_rules {
-                            let applies_on_layer = p.is_empty()
-                                || tree.layer_leaves.values().any(|leaf| {
-                                    leaf.path.starts_with_path(p)
-                                        && leaf.active_layers.contains(layer_idx)
-                                });
-                            if !applies_on_layer {
-                                let skip_msg = format!(
-                                    "{sel_origin}.{p} skipped on layer {layer_idx} (component absent on this layer)"
-                                );
-                                if !provenance.skipped_rules.contains(&skip_msg) {
-                                    provenance.skipped_rules.push(skip_msg);
-                                }
-                            }
-                            selector_layer_rules[layer_idx].insert(p.clone(), r.clone());
-                        }
-                    }
+                    selectors.push((LayerSelector::parse(key)?, val));
                 } else {
                     let path = ComponentPath::new(key);
                     if !superset.is_valid_layer_path(&path) && !tree.is_valid_layer_path(&path) {
@@ -718,10 +828,59 @@ impl RuntimeConfig {
                         &format!("hidden-layers.{key}"),
                         true,
                         &tree,
-                        &superset,
+                        superset,
                         &mut general_layer_rules,
                         &mut provenance.skipped_rules,
                     )?;
+                }
+            }
+            check_selector_overlaps(&selectors)?;
+
+            for (selector, val) in &selectors {
+                let out_of_range = selector.out_of_range(num_layers);
+                if !out_of_range.is_empty() {
+                    let msg = format!(
+                        "layer selector '{}' references layers {} outside model range [0, {})",
+                        selector.raw,
+                        format_ranges(&out_of_range),
+                        num_layers
+                    );
+                    if strict {
+                        return Err(LumenError::Config(msg));
+                    }
+                    provenance.warnings.push(msg);
+                }
+
+                let sel_origin = format!("hidden-layers[\"{}\"]", selector.raw);
+                let mut parsed_sel_rules: BTreeMap<ComponentPath, PartialPlace> = BTreeMap::new();
+                collect_subtree_rules(
+                    val,
+                    &ComponentPath::new(""),
+                    &sel_origin,
+                    true,
+                    &tree,
+                    superset,
+                    &mut parsed_sel_rules,
+                    &mut provenance.skipped_rules,
+                )?;
+
+                for layer_idx in selector.layers_within(num_layers) {
+                    for (p, r) in &parsed_sel_rules {
+                        let applies_on_layer = p.is_empty()
+                            || tree.layer_leaves.values().any(|leaf| {
+                                leaf.path.starts_with_path(p)
+                                    && leaf.active_layers.contains(layer_idx)
+                            });
+                        if !applies_on_layer {
+                            let skip_msg = format!(
+                                "{sel_origin}.{p} skipped on layer {layer_idx} (component absent on this layer)"
+                            );
+                            if !provenance.skipped_rules.contains(&skip_msg) {
+                                provenance.skipped_rules.push(skip_msg);
+                            }
+                        }
+                        selector_layer_rules[layer_idx].insert(p.clone(), r.clone());
+                    }
                 }
             }
         }
@@ -751,8 +910,6 @@ impl RuntimeConfig {
         let mut kv = Vec::new();
         let mut state = Vec::new();
 
-        let kv_path = ComponentPath::new("attention/kv-cache");
-        let state_path = ComponentPath::new("linear-attention/state");
         let empty_path = ComponentPath::new("");
 
         for layer_idx in 0..tree.num_hidden_layers {
@@ -780,14 +937,14 @@ impl RuntimeConfig {
                 }
 
                 let (place, origin) = finalize_place(resolved);
-                if *path == kv_path {
+                if leaf.kind == ComponentKind::KvCache {
                     kv.push(KvPlacement {
                         layer: layer_idx,
                         place,
                         k_bits: self.kv_quantization.map(|q| q.k_bits),
                         v_bits: self.kv_quantization.map(|q| q.v_bits),
                     });
-                } else if *path == state_path {
+                } else if leaf.kind == ComponentKind::RecurrentState {
                     state.push(StatePlacement {
                         layer: layer_idx,
                         place,
@@ -1027,7 +1184,11 @@ impl PlacementPlan {
         );
         for (layers_list, map_idx) in self.group_identical_layers() {
             let range_label = format_layer_index_list(&layers_list);
-            let _ = writeln!(out, "\n[Layers {range_label}] ({} layers):", layers_list.len());
+            let _ = writeln!(
+                out,
+                "\n[Layers {range_label}] ({} layers):",
+                layers_list.len()
+            );
             let _ = writeln!(
                 out,
                 "  {:<36} {:<8} {:<8} {:<10} {:<12} {:<12} Rule Source",
@@ -1133,161 +1294,497 @@ impl fmt::Display for Place {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumen_core::LayerMask;
+
+    // ------------------------------------------------------------------------------------
+    // Hand-built component trees. `lumen-config` must not know any model family, so the tests
+    // describe the shapes they need directly (real architectures are tested in `lumen-models`).
+    // ------------------------------------------------------------------------------------
+
+    #[derive(Clone)]
+    struct Shape {
+        layers: usize,
+        attention: LayerMask,
+        linear_attention: LayerMask,
+        dense_mlp: LayerMask,
+        moe: LayerMask,
+        ple: bool,
+    }
+
+    impl Shape {
+        fn dense(layers: usize) -> Self {
+            Self {
+                layers,
+                attention: LayerMask::all(layers),
+                linear_attention: LayerMask::empty(),
+                dense_mlp: LayerMask::all(layers),
+                moe: LayerMask::empty(),
+                ple: false,
+            }
+        }
+
+        fn moe(layers: usize) -> Self {
+            Self {
+                layers,
+                attention: LayerMask::from_fn(layers, |l| (l + 1) % 4 == 0),
+                linear_attention: LayerMask::from_fn(layers, |l| (l + 1) % 4 != 0),
+                dense_mlp: LayerMask::empty(),
+                moe: LayerMask::all(layers),
+                ple: true,
+            }
+        }
+
+        fn tree(&self) -> ComponentTree {
+            use ComponentKind::*;
+            let mut t = ComponentTree::new("test-model", self.layers);
+            t.add_global("input-layer", RowTable);
+            t.add_global("output-layer/norm", DenseWeight);
+            t.add_global("output-layer/lm-head", DenseWeight);
+            if self.ple {
+                t.add_global("ple/table", RowTable);
+                t.add_global("ple/projections", DenseWeight);
+            }
+            t.add_layer("norms/input-norm", DenseWeight, LayerMask::all(self.layers));
+            for p in ["q", "k", "v", "o"] {
+                t.add_layer(
+                    format!("attention/{p}"),
+                    DenseWeight,
+                    self.attention.clone(),
+                );
+            }
+            t.add_layer("attention/kv-cache", KvCache, self.attention.clone());
+            t.add_layer(
+                "linear-attention/projections/qkv",
+                DenseWeight,
+                self.linear_attention.clone(),
+            );
+            t.add_layer(
+                "linear-attention/state",
+                RecurrentState,
+                self.linear_attention.clone(),
+            );
+            for p in ["gate", "up", "down"] {
+                t.add_layer(
+                    format!("dense-mlp/{p}"),
+                    DenseWeight,
+                    self.dense_mlp.clone(),
+                );
+            }
+            t.add_layer("moe/router", DenseWeight, self.moe.clone());
+            t.add_layer(
+                "moe/routed-experts/projections",
+                ExpertBank,
+                self.moe.clone(),
+            );
+            t
+        }
+    }
+
+    /// Every path the "supported architectures" could have: what `lumen-models` provides.
+    fn known() -> ComponentTree {
+        let mut s = Shape::moe(1);
+        s.dense_mlp = LayerMask::all(1);
+        let mut t = s.tree();
+        t.add_layer(
+            "hyper-connections",
+            ComponentKind::DenseWeight,
+            LayerMask::empty(),
+        );
+        t.add_layer(
+            "attention/indexer/keys",
+            ComponentKind::IndexerCache,
+            LayerMask::empty(),
+        );
+        t.add_global("vision-tower", ComponentKind::DenseWeight);
+        t
+    }
+
+    fn cfg(model_body: &str) -> RuntimeConfig {
+        RuntimeConfig::from_json_str(&format!(
+            r#"{{"model": {{"path": "model.ltq", "compute": "cuda:0", "store": "vram:0", {model_body} }}}}"#
+        ))
+        .unwrap()
+    }
+
+    const MIN: &str = r#"{"model":{"path":"m","compute":"cuda:0","store":"vram:0"}}"#;
+
+    // ------------------------------------------------------------------------------------
+    // Cascade and access modes
+    // ------------------------------------------------------------------------------------
 
     #[test]
-    fn test_example_dense_config_resolution() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/example-dense.json");
-        let cfg = RuntimeConfig::from_file(&path).expect("example-dense.json should parse");
-        let tree = ComponentTree::preset("dense", 64);
-
+    fn test_dense_cascade_and_access_modes() {
+        let cfg = cfg(r#"
+            "input-layer": { "store": "ram:0" },
+            "hidden-layers": {
+                "dense-mlp": { "compute": "cpu:0", "store": "ram:0", "prefill-compute": "cuda:0" },
+                "36-63": { "dense-mlp": { "compute": "cuda:0", "store": "vram:0" } }
+            }"#);
         let plan = cfg
-            .resolve_plan(tree, true)
-            .expect("plan resolution should succeed");
+            .resolve_plan(Shape::dense(64).tree(), &known(), true)
+            .unwrap();
 
-        let input_place = plan.global[&ComponentPath::new("input-layer")];
-        assert_eq!(input_place.store, MemLoc::Ram(0));
-        assert_eq!(input_place.compute, Device::Cuda(0));
+        let input = plan.global[&ComponentPath::new("input-layer")];
         assert_eq!(
-            input_place.decode_access_mode(ComponentKind::SparseWeight),
+            (input.store, input.compute),
+            (MemLoc::Ram(0), Device::Cuda(0))
+        );
+        assert_eq!(
+            input.decode_access_mode(ComponentKind::RowTable),
             AccessMode::ZeroCopy
         );
 
-        let mlp_l0 = plan.layers[0][&ComponentPath::new("dense-mlp/gate")];
-        assert_eq!(mlp_l0.compute, Device::Cpu(0));
-        assert_eq!(mlp_l0.store, MemLoc::Ram(0));
-        assert_eq!(mlp_l0.prefill_compute, Some(Device::Cuda(0)));
+        let gate0 = plan.layers[0][&ComponentPath::new("dense-mlp/gate")];
+        assert_eq!(gate0.compute, Device::Cpu(0));
+        assert_eq!(gate0.store, MemLoc::Ram(0));
+        assert_eq!(gate0.prefill_compute, Some(Device::Cuda(0)));
         assert_eq!(
-            mlp_l0.decode_access_mode(ComponentKind::DenseWeight),
+            gate0.decode_access_mode(ComponentKind::DenseWeight),
             AccessMode::Direct
         );
         assert_eq!(
-            mlp_l0.prefill_access_mode(ComponentKind::DenseWeight),
+            gate0.prefill_access_mode(ComponentKind::DenseWeight),
             AccessMode::Streamed
         );
 
-        let mlp_l36 = plan.layers[36][&ComponentPath::new("dense-mlp/gate")];
-        assert_eq!(mlp_l36.compute, Device::Cuda(0));
-        assert_eq!(mlp_l36.store, MemLoc::Vram(0));
+        // Layer selector beats the general hidden-layers rule.
+        let gate36 = plan.layers[36][&ComponentPath::new("dense-mlp/gate")];
         assert_eq!(
-            mlp_l36.decode_access_mode(ComponentKind::DenseWeight),
+            (gate36.compute, gate36.store),
+            (Device::Cuda(0), MemLoc::Vram(0))
+        );
+        // Each key cascades independently: the selector did not mention `prefill-compute`, so the
+        // value from the general `dense-mlp` rule is still in effect.
+        assert_eq!(gate36.prefill_compute, Some(Device::Cuda(0)));
+        assert_eq!(
+            gate36.prefill_access_mode(ComponentKind::DenseWeight),
             AccessMode::Direct
         );
+
+        // Components not mentioned inherit the model root.
+        let q = plan.layers[10][&ComponentPath::new("attention/q")];
+        assert_eq!((q.compute, q.store), (Device::Cuda(0), MemLoc::Vram(0)));
     }
 
     #[test]
-    fn test_example_moe_config_resolution() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/example-moe.json");
-        let cfg = RuntimeConfig::from_file(&path).expect("example-moe.json should parse");
-        let tree = ComponentTree::preset("qwen4_exp", 48);
-
+    fn test_moe_cascade_and_access_modes() {
+        let cfg = cfg(r#"
+            "input-layer": { "store": "ram:0" },
+            "ple": { "table": { "store": "disk" } },
+            "hidden-layers": {
+                "moe": { "routed-experts": {
+                    "compute": "cpu:0", "store": "ram:0", "prefill-compute": "cuda:0" } },
+                "32-47": { "moe": { "routed-experts": { "compute": "cuda:0", "store": "vram:0" } } }
+            }"#);
         let plan = cfg
-            .resolve_plan(tree, true)
-            .expect("plan resolution should succeed");
+            .resolve_plan(Shape::moe(48).tree(), &known(), true)
+            .unwrap();
 
-        let ple_table = plan.global[&ComponentPath::new("ple/table")];
-        assert_eq!(ple_table.store, MemLoc::Disk);
-        assert_eq!(ple_table.compute, Device::Cuda(0));
+        let table = plan.global[&ComponentPath::new("ple/table")];
+        assert_eq!(table.store, MemLoc::Disk);
         assert_eq!(
-            ple_table.decode_access_mode(ComponentKind::SparseWeight),
+            table.decode_access_mode(ComponentKind::RowTable),
             AccessMode::FetchH2d
         );
 
-        let exp_l0 = plan.layers[0][&ComponentPath::new("moe/routed-experts/projections")];
-        assert_eq!(exp_l0.compute, Device::Cpu(0));
-        assert_eq!(exp_l0.store, MemLoc::Ram(0));
-        assert_eq!(exp_l0.prefill_compute, Some(Device::Cuda(0)));
+        let experts = ComponentPath::new("moe/routed-experts/projections");
+        let e0 = plan.layers[0][&experts];
+        assert_eq!((e0.compute, e0.store), (Device::Cpu(0), MemLoc::Ram(0)));
         assert_eq!(
-            exp_l0.decode_access_mode(ComponentKind::SparseWeight),
+            e0.decode_access_mode(ComponentKind::ExpertBank),
             AccessMode::Direct
         );
+        // A prefill chunk touches (almost) every expert: the bank is streamed, not gathered.
         assert_eq!(
-            exp_l0.prefill_access_mode(ComponentKind::SparseWeight),
+            e0.prefill_access_mode(ComponentKind::ExpertBank),
             AccessMode::Streamed
         );
 
-        let exp_l32 = plan.layers[32][&ComponentPath::new("moe/routed-experts/projections")];
-        assert_eq!(exp_l32.compute, Device::Cuda(0));
-        assert_eq!(exp_l32.store, MemLoc::Vram(0));
+        let e32 = plan.layers[32][&experts];
+        assert_eq!((e32.compute, e32.store), (Device::Cuda(0), MemLoc::Vram(0)));
     }
 
     #[test]
+    fn test_prefill_compute_does_not_turn_embedding_gather_into_streaming() {
+        let cfg = cfg(r#""prefill-compute": "cuda:0", "input-layer": { "store": "ram:0" }"#);
+        let plan = cfg
+            .resolve_plan(Shape::dense(4).tree(), &known(), true)
+            .unwrap();
+        let p = plan.global[&ComponentPath::new("input-layer")];
+        assert_eq!(
+            p.decode_access_mode(ComponentKind::RowTable),
+            AccessMode::ZeroCopy
+        );
+        assert_eq!(
+            p.prefill_access_mode(ComponentKind::RowTable),
+            AccessMode::ZeroCopy
+        );
+    }
+
+    #[test]
+    fn test_kv_and_state_placements_follow_component_kinds() {
+        let shape = Shape::moe(8); // attention on layers 3 and 7, linear attention elsewhere
+        let cfg = RuntimeConfig::from_json_str(
+            r#"{"model": {"path": "m", "compute": "cuda:0", "store": "vram:0",
+                "hidden-layers": { "attention": { "kv-cache": { "store": "ram:0" } } }},
+                "kv-quantization": { "k-bits": 8, "v-bits": 5 }}"#,
+        )
+        .unwrap();
+        let plan = cfg.resolve_plan(shape.tree(), &known(), true).unwrap();
+
+        assert_eq!(
+            plan.kv.iter().map(|k| k.layer).collect::<Vec<_>>(),
+            vec![3, 7]
+        );
+        assert!(plan.kv.iter().all(|k| k.place.store == MemLoc::Ram(0)));
+        assert!(
+            plan.kv
+                .iter()
+                .all(|k| (k.k_bits, k.v_bits) == (Some(8), Some(5)))
+        );
+        assert_eq!(
+            plan.state.iter().map(|s| s.layer).collect::<Vec<_>>(),
+            vec![0, 1, 2, 4, 5, 6]
+        );
+
+        // A dense model has neither recurrent state nor (when attention is absent) a KV cache.
+        let plan = cfg_min()
+            .resolve_plan(Shape::dense(4).tree(), &known(), true)
+            .unwrap();
+        assert_eq!(plan.kv.len(), 4);
+        assert!(plan.state.is_empty());
+    }
+
+    fn cfg_min() -> RuntimeConfig {
+        RuntimeConfig::from_json_str(MIN).unwrap()
+    }
+
+    #[test]
+    fn test_more_than_128_layers_resolve_completely() {
+        let plan = cfg_min()
+            .resolve_plan(Shape::dense(200).tree(), &known(), true)
+            .unwrap();
+        assert_eq!(plan.layers.len(), 200);
+        let per_layer = plan.layers[0].len();
+        assert!(per_layer > 0);
+        assert!(plan.layers.iter().all(|l| l.len() == per_layer));
+        assert_eq!(plan.kv.len(), 200);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Validation
+    // ------------------------------------------------------------------------------------
+
+    #[test]
     fn test_absent_components_recorded_in_skipped_rules() {
-        let json = r#"{
-            "model": {
-                "path": "Qwen3.8-27B.ltq",
-                "compute": "cuda:0",
-                "store": "vram:0",
-                "ple": {
-                    "table": { "store": "disk" }
-                },
-                "hidden-layers": {
-                    "attention": {
-                        "indexer": { "store": "ram:0" }
-                    },
-                    "hyper-connections": { "compute": "cpu:0" }
-                }
-            }
-        }"#;
-        let cfg = RuntimeConfig::from_json_str(json).unwrap();
-        let tree = ComponentTree::preset("dense", 64);
-        let plan = cfg.resolve_plan(tree, true).unwrap();
-        assert_eq!(plan.provenance.skipped_rules.len(), 3);
+        let cfg = cfg(r#"
+            "ple": { "table": { "store": "disk" } },
+            "hidden-layers": {
+                "attention": { "indexer": { "keys": { "store": "ram:0" } } },
+                "hyper-connections": { "compute": "cpu:0" }
+            }"#);
+        let plan = cfg
+            .resolve_plan(Shape::dense(64).tree(), &known(), true)
+            .unwrap();
+        assert_eq!(
+            plan.provenance.skipped_rules.len(),
+            3,
+            "{:?}",
+            plan.provenance.skipped_rules
+        );
     }
 
     #[test]
     fn test_overlapping_layer_selectors_rejected() {
-        let json = r#"{
-            "model": {
-                "path": "test.ltq",
-                "compute": "cuda:0",
-                "store": "vram:0",
-                "hidden-layers": {
-                    "0-15": { "moe": { "compute": "cpu:0" } },
-                    "12-23": { "moe": { "compute": "cuda:0" } }
-                }
-            }
-        }"#;
-        let cfg = RuntimeConfig::from_json_str(json).unwrap();
-        let tree = ComponentTree::preset("moe", 24);
-        let err = cfg.resolve_plan(tree, true).unwrap_err();
-        assert!(err.to_string().contains("overlapping layer selectors"));
-    }
-
-    #[test]
-    fn test_unknown_key_suggestion() {
-        let json = r#"{
-            "model": {
-                "path": "test.ltq",
-                "compute": "cuda:0",
-                "stor": "vram:0"
-            }
-        }"#;
-        let cfg = RuntimeConfig::from_json_str(json).unwrap();
-        let tree = ComponentTree::preset("dense", 16);
-        let err = cfg.resolve_plan(tree, true).unwrap_err();
+        let cfg = cfg(r#""hidden-layers": {
+            "0-15": { "moe": { "compute": "cpu:0" } },
+            "12-23": { "moe": { "compute": "cuda:0" } } }"#);
+        let err = cfg
+            .resolve_plan(Shape::moe(24).tree(), &known(), true)
+            .unwrap_err();
         assert!(
-            err.to_string().contains("did you mean 'store'?"),
-            "unexpected error: {err}"
+            err.to_string().contains("overlapping layer selectors"),
+            "{err}"
+        );
+
+        // Within a single selector, and adjacent-but-disjoint selectors are fine.
+        let cfg = super::tests::cfg(r#""hidden-layers": { "0-5,3-8": {} }"#);
+        assert!(
+            cfg.resolve_plan(Shape::moe(24).tree(), &known(), true)
+                .is_err()
+        );
+        let cfg = super::tests::cfg(r#""hidden-layers": { "0-7": {}, "8-15": {}, "20": {} }"#);
+        assert!(
+            cfg.resolve_plan(Shape::moe(24).tree(), &known(), true)
+                .is_ok()
         );
     }
 
     #[test]
-    fn test_out_of_range_selector_warning_vs_strict() {
-        let json = r#"{
-            "model": {
-                "path": "test.ltq",
-                "compute": "cuda:0",
-                "store": "vram:0",
-                "hidden-layers": {
-                    "10-20": { "dense-mlp": { "compute": "cpu:0" } }
-                }
-            }
-        }"#;
-        let cfg = RuntimeConfig::from_json_str(json).unwrap();
-        let tree = ComponentTree::preset("dense", 16);
+    fn test_unknown_key_suggestion() {
+        let cfg = RuntimeConfig::from_json_str(
+            r#"{"model": {"path": "t", "compute": "cuda:0", "stor": "vram:0"}}"#,
+        )
+        .unwrap();
+        let err = cfg
+            .resolve_plan(Shape::dense(16).tree(), &known(), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("did you mean 'store'?"), "{err}");
+    }
 
-        let plan = cfg.resolve_plan(tree.clone(), false).unwrap();
+    #[test]
+    fn test_out_of_range_selector_warning_vs_strict() {
+        let cfg = cfg(r#""hidden-layers": { "10-20": { "dense-mlp": { "compute": "cpu:0" } } }"#);
+        let tree = Shape::dense(16).tree();
+
+        let plan = cfg.resolve_plan(tree.clone(), &known(), false).unwrap();
         assert_eq!(plan.provenance.warnings.len(), 1);
-        assert!(cfg.resolve_plan(tree, true).is_err());
+        assert!(
+            plan.provenance.warnings[0].contains("16-20"),
+            "{:?}",
+            plan.provenance.warnings
+        );
+        // The in-range part is still applied.
+        let gate = plan.layers[15][&ComponentPath::new("dense-mlp/gate")];
+        assert_eq!(gate.compute, Device::Cpu(0));
+        assert!(cfg.resolve_plan(tree, &known(), true).is_err());
+    }
+
+    #[test]
+    fn test_huge_selector_ranges_are_handled_without_enumerating_layers() {
+        let start = std::time::Instant::now();
+        let cfg =
+            cfg(r#""hidden-layers": { "0-4000000000": { "dense-mlp": { "compute": "cpu:0" } } }"#);
+        let plan = cfg
+            .resolve_plan(Shape::dense(16).tree(), &known(), false)
+            .unwrap();
+        assert_eq!(plan.provenance.warnings.len(), 1);
+        assert!(plan.provenance.warnings[0].contains("16-4000000000"));
+        assert!(
+            cfg.resolve_plan(Shape::dense(16).tree(), &known(), true)
+                .is_err()
+        );
+
+        let cfg = super::tests::cfg(r#""hidden-layers": { "0-4000000000": {}, "5-6": {} }"#);
+        assert!(
+            cfg.resolve_plan(Shape::dense(16).tree(), &known(), false)
+                .is_err()
+        );
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "selector handling must not enumerate layers"
+        );
+    }
+
+    #[test]
+    fn test_layer_selector_parsing() {
+        let s = LayerSelector::parse("0-3, 7").unwrap();
+        assert_eq!(s.ranges, vec![(0, 3), (7, 7)]);
+        assert_eq!(s.layers_within(5).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(s.out_of_range(5), vec![(7, 7)]);
+        assert_eq!(s.out_of_range(100), vec![]);
+        assert!(LayerSelector::parse("5-3").is_err());
+        assert!(LayerSelector::parse("1,,2").is_err());
+        assert!(LayerSelector::parse("a-b").is_err());
+        assert_eq!(
+            LayerSelector::parse("2").unwrap().layers_within(0).count(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_runtime_section_validation() {
+        let bad = [
+            r#""model": {"path":"m","compute":"cuda:0","store":"vram:0","sampling":{"temperature":-1}}"#,
+            r#""model": {"path":"m","compute":"cuda:0","store":"vram:0","sampling":{"top-p":0}}"#,
+            r#""model": {"path":"m","compute":"cuda:0","store":"vram:0","sampling":{"top-p":1.5}}"#,
+            r#""model": {"path":"m","compute":"cuda:0","store":"vram:0","sampling":{"min-p":2}}"#,
+            r#""model": {"path":"m","compute":"cuda:0","store":"vram:0"}, "cuda": {"prefill-chunk-size": 0}"#,
+            r#""model": {"path":"m","compute":"cuda:0","store":"vram:0"}, "disk": {"io-threads": 0}"#,
+            r#""model": {"path":"m","compute":"cuda:0","store":"vram:0"}, "server": {"max-concurrent-requests": 0}"#,
+            r#""model": {"path":"m","compute":"cuda:0","store":"vram:0"}, "server": {"host": " "}"#,
+            r#""model": {"path":"m","compute":"cuda:0","store":"vram:0"}, "context": {"size": 0}"#,
+            r#""model": {"path":"m","compute":"cuda:0","store":"vram:0"}, "kv-quantization": {"k-bits": 1, "v-bits": 8}"#,
+            r#""model": {"path":"m","compute":"cuda:0","store":"vram:0"}, "attention-mechanism": "paged-magic""#,
+        ];
+        for body in bad {
+            let json = format!("{{{body}}}");
+            assert!(
+                RuntimeConfig::from_json_str(&json).is_err(),
+                "must be rejected: {json}"
+            );
+        }
+        assert!(RuntimeConfig::from_json_str(MIN).is_ok());
+    }
+
+    #[test]
+    fn test_known_keys_match_struct_fields() {
+        fn keys<T: Serialize>(v: &T) -> BTreeSet<String> {
+            serde_json::to_value(v)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        }
+        fn expected(k: &[&str]) -> BTreeSet<String> {
+            k.iter().map(|s| (*s).to_string()).collect()
+        }
+        assert_eq!(
+            keys(&SamplingConfig::default()),
+            expected(SamplingConfig::KEYS)
+        );
+        assert_eq!(
+            keys(&ChatTemplateConfig::default()),
+            expected(ChatTemplateConfig::KEYS)
+        );
+        assert_eq!(
+            keys(&ContextConfig::default()),
+            expected(ContextConfig::KEYS)
+        );
+        assert_eq!(
+            keys(&KvQuantizationConfig {
+                k_bits: 8,
+                v_bits: 8
+            }),
+            expected(KvQuantizationConfig::KEYS)
+        );
+        assert_eq!(
+            keys(&CudaRuntimeConfig::default()),
+            expected(CudaRuntimeConfig::KEYS)
+        );
+        assert_eq!(
+            keys(&CpuRuntimeConfig::default()),
+            expected(CpuRuntimeConfig::KEYS)
+        );
+        assert_eq!(
+            keys(&DiskRuntimeConfig::default()),
+            expected(DiskRuntimeConfig::KEYS)
+        );
+        assert_eq!(
+            keys(&ServerRuntimeConfig::default()),
+            expected(ServerRuntimeConfig::KEYS)
+        );
+    }
+
+    #[test]
+    fn test_defaults_and_attention_mechanism() {
+        let cfg = cfg_min();
+        assert_eq!(cfg.attention_mechanism, AttentionMechanism::FlashAttention);
+        assert_eq!(cfg.attention_mechanism.as_str(), "flash-attention");
+        assert_eq!(cfg.context.size, 32768);
+        assert!(cfg.cuda.cuda_graphs);
+    }
+
+    #[test]
+    fn test_format_inspect_groups_identical_layers() {
+        let cfg = cfg(r#""hidden-layers": { "2-3": { "dense-mlp": { "compute": "cpu:0" } } }"#);
+        let plan = cfg
+            .resolve_plan(Shape::dense(6).tree(), &known(), true)
+            .unwrap();
+        let text = plan.format_inspect(&cfg);
+        assert!(text.contains("[Layers 0-1, 4-5] (4 layers)"), "{text}");
+        assert!(text.contains("[Layers 2-3] (2 layers)"), "{text}");
     }
 }

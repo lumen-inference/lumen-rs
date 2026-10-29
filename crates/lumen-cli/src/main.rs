@@ -6,7 +6,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use lumen_config::RuntimeConfig;
+use lumen_core::{ComponentTree, LumenError};
 use lumen_format::LtqContainer;
+use lumen_models::{architecture_from_config, architecture_from_header, known_components};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -30,6 +32,12 @@ enum Commands {
         /// Treat out-of-range layer selectors as hard errors instead of warnings.
         #[arg(long)]
         strict: bool,
+
+        /// Take the model architecture from this HuggingFace `config.json` instead of opening
+        /// the `.ltq` file named by `model.path` (lets you inspect a placement before the model
+        /// has been quantized).
+        #[arg(long, value_name = "CONFIG_JSON")]
+        model_config: Option<PathBuf>,
     },
 
     /// Single-prompt generation in the terminal.
@@ -87,28 +95,61 @@ enum Commands {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Err(err) = run_cmd(cli.command) {
-        eprintln!("error: {err}");
-        return ExitCode::FAILURE;
+    match run_cmd(cli.command) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
     }
-    ExitCode::SUCCESS
 }
 
-fn run_cmd(cmd: Commands) -> lumen_core::Result<()> {
-    match cmd {
-        Commands::Inspect { config, strict } => {
-            let cfg = RuntimeConfig::from_file(&config)?;
+type CliResult = Result<(), Box<dyn std::error::Error>>;
+
+fn component_tree_for(
+    cfg: &RuntimeConfig,
+    model_config: Option<&PathBuf>,
+) -> Result<ComponentTree, LumenError> {
+    match model_config {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)?;
+            let json = serde_json::from_str(&text).map_err(|e| {
+                LumenError::Format(format!("invalid JSON in '{}': {e}", path.display()))
+            })?;
+            Ok(architecture_from_config(&json)?.components())
+        }
+        None => {
             let container = LtqContainer::open(&cfg.model_path)?;
-            let tree = container.header.component_tree()?;
-            let plan = cfg.resolve_plan(tree, strict)?;
+            Ok(architecture_from_header(&container.header)?.components())
+        }
+    }
+}
+
+fn run_cmd(cmd: Commands) -> CliResult {
+    match cmd {
+        Commands::Inspect {
+            config,
+            strict,
+            model_config,
+        } => {
+            let cfg = RuntimeConfig::from_file(&config)?;
+            let tree = component_tree_for(&cfg, model_config.as_ref())?;
+            let plan = cfg.resolve_plan(tree, &known_components(), strict)?;
             print!("{}", plan.format_inspect(&cfg));
             Ok(())
         }
+        // Not implemented yet: fail loudly so scripts do not mistake a no-op for success.
         other => {
-            eprintln!(
-                "command '{other:?}' will be wired in upcoming phases (see docs/RU/roadmap.md)"
-            );
-            Ok(())
+            let name = format!("{other:?}");
+            let name = name
+                .split([' ', '{'])
+                .next()
+                .unwrap_or("command")
+                .to_lowercase();
+            Err(format!(
+                "'{name}' is not implemented yet (see docs/EN/roadmap.md for the phase that adds it)"
+            )
+            .into())
         }
     }
 }

@@ -37,6 +37,10 @@ bytemuck = { version = "1.18", features = ["derive"] }
 memmap2 = "0.9"
 clap = { version = "4.5", features = ["derive"] }
 
+# `usize::is_multiple_of` is newer than the workspace MSRV (1.89); keep using `% n == 0`.
+[workspace.lints.clippy]
+manual_is_multiple_of = "allow"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

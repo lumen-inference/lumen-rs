@@ -656,7 +656,7 @@ mod tests {
         let bit = |w: &[u16], i: usize| ((w[i >> 4] >> (i & 15)) & 1) as u32;
         let wpp = len / 16;
         let mut q = vec![0f32; len];
-        for t in 0..len {
+        for (t, slot) in q.iter_mut().enumerate() {
             let mut s = 0u32;
             for j in 0..10 {
                 s |= bit(codes, (t + len - j % len) % len) << j;
@@ -680,7 +680,7 @@ mod tests {
             for i in 0..f.h {
                 g |= (bit(gains, (t / f.sub) * f.h + i) as usize) << i;
             }
-            q[t] = f.gain[g] * f.lut[((label as usize) << (f.k - 1)) | u as usize];
+            *slot = f.gain[g] * f.lut[((label as usize) << (f.k - 1)) | u as usize];
         }
         q
     }
@@ -762,7 +762,8 @@ mod tests {
         let good = random_format(&mut rng, 3, Frac::None, 2, 2, 16);
         good.validate().unwrap();
 
-        let mutations: Vec<(&str, Box<dyn Fn(&mut LtqFormat)>)> = vec![
+        type Mutation = Box<dyn Fn(&mut LtqFormat)>;
+        let mutations: Vec<(&str, Mutation)> = vec![
             ("huge h", Box::new(|f| f.h = 70)),
             ("h above menu", Box::new(|f| f.h = 5)),
             ("k too small", Box::new(|f| f.k = 1)),

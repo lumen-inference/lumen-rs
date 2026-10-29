@@ -1,6 +1,6 @@
 [package]
 name = "lumen-core"
-description = "DType (incl. quant types), Shape, Device, MemLoc, ComponentPath, errors."
+description = "DType, Shape, Device, MemLoc, AccessMode, ComponentPath/ComponentTree, errors."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +10,9 @@ serde.workspace = true
 thiserror.workspace = true
 half.workspace = true
 bytemuck.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

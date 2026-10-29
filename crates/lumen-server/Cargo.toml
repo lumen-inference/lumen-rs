@@ -8,3 +8,6 @@ rust-version.workspace = true
 [dependencies]
 lumen-engine.workspace = true
 lumen-chat.workspace = true
+
+[lints]
+workspace = true

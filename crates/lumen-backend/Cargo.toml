@@ -8,3 +8,7 @@ rust-version.workspace = true
 [dependencies]
 lumen-core.workspace = true
 lumen-tensor.workspace = true
+lumen-mem.workspace = true
+
+[lints]
+workspace = true

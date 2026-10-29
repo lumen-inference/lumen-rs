@@ -1,6 +1,9 @@
 //! Foundational types for `lumen-rs`: data types (`DType`), tensor shapes (`Shape`),
 //! compute devices (`Device`), storage locations (`MemLoc`), data access modes (`AccessMode`),
 //! model component paths (`ComponentPath`, `ComponentTree`, `LayerMask`), and error types (`LumenError`).
+//!
+//! This crate knows nothing about concrete model families: component trees are built by
+//! `lumen-models` (`Architecture::components`) and only *described* here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -16,6 +19,7 @@ pub type Result<T> = std::result::Result<T, LumenError>;
 
 /// Unified error type for `lumen-rs` crates.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum LumenError {
     #[error("configuration error: {0}")]
     Config(String),
@@ -44,8 +48,10 @@ pub enum LumenError {
 // ============================================================================
 
 /// Scalar element data type for tensors and container descriptors.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// Serialized as the canonical lowercase name (`"bf16"`); deserialization goes through
+/// [`FromStr`], so it also accepts the spellings used by `safetensors` (`"BF16"`, `"F32"`, ...).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum DType {
     F32,
     F16,
@@ -88,6 +94,20 @@ impl DType {
             Self::I64 => "i64",
             Self::U64 => "u64",
         }
+    }
+}
+
+impl Serialize for DType {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -139,25 +159,27 @@ impl Shape {
         self.0.len()
     }
 
-    /// Total number of elements across all dimensions.
+    /// Total number of elements across all dimensions, or `None` if it overflows `usize`.
+    ///
+    /// Shapes come from untrusted file headers, so there is deliberately no unchecked variant.
     #[inline]
-    pub fn numel(&self) -> usize {
-        self.0.iter().copied().product()
+    pub fn checked_numel(&self) -> Option<usize> {
+        self.0.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d))
     }
 
-    /// Total size in bytes for the given `DType`.
+    /// Total size in bytes for the given `DType`, or `None` if it overflows `usize`.
     #[inline]
-    pub fn byte_len(&self, dtype: DType) -> usize {
-        self.numel().saturating_mul(dtype.element_size())
+    pub fn checked_byte_len(&self, dtype: DType) -> Option<usize> {
+        self.checked_numel()?.checked_mul(dtype.element_size())
     }
 
-    /// Contiguous row-major strides in elements.
-    pub fn contiguous_strides(&self) -> Vec<usize> {
-        let mut strides = vec![1; self.0.len()];
+    /// Contiguous row-major strides in elements, or `None` if a stride overflows `usize`.
+    pub fn contiguous_strides(&self) -> Option<Vec<usize>> {
+        let mut strides = vec![1usize; self.0.len()];
         for i in (0..self.0.len().saturating_sub(1)).rev() {
-            strides[i] = strides[i + 1] * self.0[i + 1];
+            strides[i] = strides[i + 1].checked_mul(self.0[i + 1])?;
         }
-        strides
+        Some(strides)
     }
 }
 
@@ -477,56 +499,89 @@ impl From<&str> for ComponentPath {
     }
 }
 
-/// Zero-allocation $O(1)$ bitmask of active layer indices (supports up to 128 layers).
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
-pub struct LayerMask(pub u128);
+impl From<String> for ComponentPath {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
+/// Set of layer indices on which a component exists. A growable bitset: the number of layers is
+/// not limited (models with more than 128 layers exist).
+///
+/// Invariant: no trailing zero words, so derived `Eq`/`Hash` are set equality.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub struct LayerMask {
+    words: Vec<u64>,
+}
 
 impl LayerMask {
-    pub const EMPTY: Self = Self(0);
-
-    /// Bitmask with all layers `0..num_layers` set.
+    /// The empty set.
     #[inline]
-    pub const fn all(num_layers: usize) -> Self {
-        if num_layers == 0 {
-            Self(0)
-        } else if num_layers >= 128 {
-            Self(u128::MAX)
-        } else {
-            Self((1u128 << num_layers) - 1)
-        }
+    pub const fn empty() -> Self {
+        Self { words: Vec::new() }
     }
 
-    /// Bitmask built from a predicate `f(layer_idx)`.
+    /// All layers `0..num_layers`.
+    pub fn all(num_layers: usize) -> Self {
+        let mut words = vec![u64::MAX; num_layers / 64];
+        if num_layers % 64 != 0 {
+            words.push((1u64 << (num_layers % 64)) - 1);
+        }
+        Self { words }
+    }
+
+    /// Layers `l in 0..num_layers` for which `f(l)` is true.
     pub fn from_fn(num_layers: usize, mut f: impl FnMut(usize) -> bool) -> Self {
-        let mut bits = 0u128;
-        for l in 0..num_layers.min(128) {
+        let mut mask = Self::empty();
+        for l in 0..num_layers {
             if f(l) {
-                bits |= 1u128 << l;
+                mask.insert(l);
             }
         }
-        Self(bits)
+        mask
     }
 
     #[inline]
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
     }
 
     #[inline]
-    pub const fn contains(self, layer: usize) -> bool {
-        layer < 128 && ((self.0 >> layer) & 1) != 0
+    pub fn contains(&self, layer: usize) -> bool {
+        self.words
+            .get(layer / 64)
+            .is_some_and(|w| (w >> (layer % 64)) & 1 != 0)
     }
 
-    #[inline]
     pub fn insert(&mut self, layer: usize) {
-        if layer < 128 {
-            self.0 |= 1u128 << layer;
+        let word = layer / 64;
+        if self.words.len() <= word {
+            self.words.resize(word + 1, 0);
+        }
+        self.words[word] |= 1u64 << (layer % 64);
+    }
+
+    pub fn union_with(&mut self, other: &Self) {
+        if self.words.len() < other.words.len() {
+            self.words.resize(other.words.len(), 0);
+        }
+        for (a, b) in self.words.iter_mut().zip(&other.words) {
+            *a |= b;
         }
     }
 
-    #[inline]
-    pub fn union_with(&mut self, other: Self) {
-        self.0 |= other.0;
+    /// Number of layers in the set.
+    pub fn count(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Iterates the layer indices in ascending order.
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words.iter().enumerate().flat_map(|(i, &w)| {
+            (0..64)
+                .filter(move |b| (w >> b) & 1 != 0)
+                .map(move |b| i * 64 + b)
+        })
     }
 }
 
@@ -535,10 +590,16 @@ impl LayerMask {
 pub enum ComponentKind {
     /// Dense matrix or weight tensor accessed in full during forward pass.
     DenseWeight,
-    /// Row-indexed lookup table (`RowTable`) or routed expert bank (`ExpertBank`) accessed sparsely.
-    SparseWeight,
+    /// Row-indexed lookup table (`RowTable`: embeddings, PLE, n-gram tables). Only the rows of the
+    /// current tokens are read, in decode and in prefill alike.
+    RowTable,
+    /// Bank of routed experts (`ExpertBank`). Decode reads only the selected `top-k` experts;
+    /// during prefill a chunk touches (almost) all of them, so it is read in full.
+    ExpertBank,
     /// Paged attention KV cache (`KvPool`).
     KvCache,
+    /// Compact per-token key cache scanned by the sparse-attention indexer; read like `KvCache`.
+    IndexerCache,
     /// Recurrent linear-attention or PLE state (`StatePool`).
     RecurrentState,
     /// Pure compute operator node without persistent weights (e.g., `rope`).
@@ -546,9 +607,19 @@ pub enum ComponentKind {
 }
 
 impl ComponentKind {
+    /// Whether a decode step reads only a sparse subset of rows/blocks/experts.
     #[inline]
-    pub const fn is_sparse(self) -> bool {
-        matches!(self, Self::SparseWeight)
+    pub const fn sparse_in_decode(self) -> bool {
+        matches!(
+            self,
+            Self::RowTable | Self::ExpertBank | Self::KvCache | Self::IndexerCache
+        )
+    }
+
+    /// Whether a prefill step reads only a sparse subset of rows/blocks.
+    #[inline]
+    pub const fn sparse_in_prefill(self) -> bool {
+        matches!(self, Self::RowTable | Self::KvCache | Self::IndexerCache)
     }
 }
 
@@ -557,7 +628,7 @@ impl ComponentKind {
 pub struct ComponentLeaf {
     pub path: ComponentPath,
     pub kind: ComponentKind,
-    /// Bitmask of layer indices `[0, num_layers)` where this component exists (`EMPTY` for globals).
+    /// Layer indices `[0, num_layers)` where this component exists (empty for globals).
     pub active_layers: LayerMask,
 }
 
@@ -597,7 +668,7 @@ impl ComponentTree {
             ComponentLeaf {
                 path,
                 kind,
-                active_layers: LayerMask::EMPTY,
+                active_layers: LayerMask::empty(),
             },
         );
     }
@@ -613,7 +684,7 @@ impl ComponentTree {
         self.register_prefixes(&path, true);
         self.layer_leaves
             .entry(path.clone())
-            .and_modify(|leaf| leaf.active_layers.union_with(mask))
+            .and_modify(|leaf| leaf.active_layers.union_with(&mask))
             .or_insert(ComponentLeaf {
                 path,
                 kind,
@@ -642,115 +713,6 @@ impl ComponentTree {
     #[inline]
     pub fn is_valid_layer_path(&self, path: &ComponentPath) -> bool {
         self.layer_prefixes.contains(path)
-    }
-
-    /// Canonical superset tree containing all standard architectural modules from `docs/RU/config.md`.
-    pub fn canonical_superset(num_hidden_layers: usize) -> Self {
-        Self::preset("canonical-superset", num_hidden_layers)
-    }
-
-    /// Builds a component tree for a named architecture preset (`"dense"`, `"moe"`, `"qwen3_next"`,
-    /// `"qwen4_exp"`, `"gemma4"`, or `"canonical-superset"`).
-    pub fn preset(preset: &str, num_hidden_layers: usize) -> Self {
-        let all = LayerMask::all(num_hidden_layers);
-        let none = LayerMask::EMPTY;
-        let mut tree = Self::new(preset, num_hidden_layers);
-
-        tree.add_global("input-layer", ComponentKind::SparseWeight);
-        tree.add_global("output-layer/norm", ComponentKind::DenseWeight);
-        tree.add_global("output-layer/lm-head", ComponentKind::DenseWeight);
-
-        if matches!(preset, "moe" | "qwen4_exp" | "gemma4" | "canonical-superset") {
-            tree.add_global("ple/table", ComponentKind::SparseWeight);
-            tree.add_global("ple/projections", ComponentKind::DenseWeight);
-        }
-        if matches!(preset, "gemma4" | "canonical-superset") {
-            tree.add_global("vision-tower", ComponentKind::DenseWeight);
-            tree.add_global("audio-tower", ComponentKind::DenseWeight);
-        }
-        if matches!(preset, "qwen3_next" | "qwen4_exp" | "canonical-superset") {
-            tree.add_global("mtp", ComponentKind::DenseWeight);
-        }
-
-        let (attn_mask, gdn_mask) = match preset {
-            "qwen3_next" | "qwen4_exp" => (
-                LayerMask::from_fn(num_hidden_layers, |l| (l + 1) % 4 == 0),
-                LayerMask::from_fn(num_hidden_layers, |l| (l + 1) % 4 != 0),
-            ),
-            "gemma4" => (all, none),
-            _ => (all, all),
-        };
-
-        for norm in ["norms/input-norm", "norms/post-attention-norm"] {
-            tree.add_layer(norm, ComponentKind::DenseWeight, all);
-        }
-
-        for sub in ["attention/q", "attention/k", "attention/v", "attention/o", "attention/qk-norm"] {
-            tree.add_layer(sub, ComponentKind::DenseWeight, attn_mask);
-        }
-        tree.add_layer("attention/rope", ComponentKind::ComputeOnly, attn_mask);
-        tree.add_layer("attention/kv-cache", ComponentKind::KvCache, attn_mask);
-        tree.add_layer(
-            "attention/indexer/keys",
-            ComponentKind::SparseWeight,
-            if matches!(preset, "moe" | "qwen4_exp" | "canonical-superset") {
-                attn_mask
-            } else {
-                none
-            },
-        );
-
-        for sub in [
-            "linear-attention/projections/qkv",
-            "linear-attention/projections/z",
-            "linear-attention/projections/b",
-            "linear-attention/projections/a",
-            "linear-attention/projections/qkvz",
-            "linear-attention/projections/ba",
-            "linear-attention/projections/out",
-            "linear-attention/conv",
-            "linear-attention/norm",
-        ] {
-            tree.add_layer(sub, ComponentKind::DenseWeight, gdn_mask);
-        }
-        tree.add_layer("linear-attention/state", ComponentKind::RecurrentState, gdn_mask);
-
-        let hc_mask = if matches!(preset, "qwen4_exp" | "canonical-superset") {
-            all
-        } else {
-            none
-        };
-        tree.add_layer("hyper-connections", ComponentKind::DenseWeight, hc_mask);
-
-        let dense_mask = if matches!(preset, "dense" | "gemma4" | "canonical-superset") {
-            all
-        } else {
-            none
-        };
-        for sub in ["dense-mlp/gate", "dense-mlp/up", "dense-mlp/down"] {
-            tree.add_layer(sub, ComponentKind::DenseWeight, dense_mask);
-        }
-
-        let moe_mask = if matches!(preset, "moe" | "qwen3_next" | "qwen4_exp" | "canonical-superset")
-        {
-            all
-        } else {
-            none
-        };
-        tree.add_layer("moe/router", ComponentKind::DenseWeight, moe_mask);
-        tree.add_layer("moe/shared-experts/gate", ComponentKind::DenseWeight, moe_mask);
-        tree.add_layer(
-            "moe/shared-experts/projections",
-            ComponentKind::DenseWeight,
-            moe_mask,
-        );
-        tree.add_layer(
-            "moe/routed-experts/projections",
-            ComponentKind::SparseWeight,
-            moe_mask,
-        );
-
-        tree
     }
 }
 
@@ -810,5 +772,73 @@ mod tests {
         assert!(p.starts_with_path(&ComponentPath::new("moe/routed-experts")));
         assert!(p.starts_with_path(&ComponentPath::new("moe/routed-experts/projections")));
         assert!(!p.starts_with_path(&ComponentPath::new("moe/routed")));
+    }
+
+    #[test]
+    fn test_layer_mask_beyond_128_layers() {
+        for n in [0usize, 1, 63, 64, 65, 127, 128, 129, 130, 200] {
+            let all = LayerMask::all(n);
+            assert_eq!(all.count(), n, "n={n}");
+            assert!(n == 0 || all.contains(n - 1));
+            assert!(!all.contains(n));
+            assert_eq!(all, LayerMask::from_fn(n, |_| true), "n={n}");
+            assert_eq!(all.iter().collect::<Vec<_>>(), (0..n).collect::<Vec<_>>());
+        }
+        let mut m = LayerMask::empty();
+        assert!(m.is_empty());
+        m.insert(300);
+        assert!(m.contains(300) && !m.contains(299) && !m.is_empty());
+        let mut n = LayerMask::from_fn(10, |l| l % 3 == 0);
+        n.union_with(&m);
+        assert_eq!(n.iter().collect::<Vec<_>>(), vec![0, 3, 6, 9, 300]);
+        // Equality is set equality regardless of construction order.
+        assert_eq!(LayerMask::from_fn(70, |l| l == 69), {
+            let mut x = LayerMask::empty();
+            x.insert(69);
+            x
+        });
+    }
+
+    #[test]
+    fn test_dtype_serde_accepts_safetensors_names() {
+        for (json, want) in [
+            ("\"bf16\"", DType::BF16),
+            ("\"BF16\"", DType::BF16),
+            ("\"F32\"", DType::F32),
+            ("\"u8\"", DType::U8),
+        ] {
+            assert_eq!(serde_json::from_str::<DType>(json).unwrap(), want);
+        }
+        assert_eq!(serde_json::to_string(&DType::F16).unwrap(), "\"f16\"");
+        assert!(serde_json::from_str::<DType>("\"BOOL\"").is_err());
+    }
+
+    #[test]
+    fn test_shape_checked_arithmetic() {
+        let s = Shape::from([4usize, 8, 2]);
+        assert_eq!(s.checked_numel(), Some(64));
+        assert_eq!(s.checked_byte_len(DType::BF16), Some(128));
+        assert_eq!(s.contiguous_strides(), Some(vec![16, 2, 1]));
+        assert_eq!(Shape::from([0usize, usize::MAX]).checked_numel(), Some(0));
+        let huge = Shape::from([usize::MAX, 2]);
+        assert_eq!(huge.checked_numel(), None);
+        assert_eq!(
+            Shape::from([usize::MAX / 2 + 1]).checked_byte_len(DType::U16),
+            None
+        );
+        assert_eq!(huge.contiguous_strides(), Some(vec![2, 1]));
+        assert_eq!(
+            Shape::from([2usize, usize::MAX, 2]).contiguous_strides(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_component_kind_access_semantics() {
+        // Embedding tables are gathered in prefill too; routed experts are read in full there.
+        assert!(ComponentKind::RowTable.sparse_in_prefill());
+        assert!(ComponentKind::ExpertBank.sparse_in_decode());
+        assert!(!ComponentKind::ExpertBank.sparse_in_prefill());
+        assert!(!ComponentKind::DenseWeight.sparse_in_decode());
     }
 }

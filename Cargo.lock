@@ -172,6 +172,7 @@ name = "lumen-backend"
 version = "0.1.0"
 dependencies = [
  "lumen-core",
+ "lumen-mem",
  "lumen-tensor",
 ]
 
@@ -192,6 +193,7 @@ dependencies = [
  "lumen-core",
  "lumen-engine",
  "lumen-format",
+ "lumen-models",
  "lumen-quantize",
  "lumen-server",
  "serde_json",
@@ -213,6 +215,7 @@ dependencies = [
  "bytemuck",
  "half",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -290,6 +293,7 @@ version = "0.1.0"
 dependencies = [
  "half",
  "lumen-core",
+ "lumen-kabi",
  "serde",
  "serde_json",
 ]
@@ -313,9 +317,11 @@ dependencies = [
 name = "lumen-models"
 version = "0.1.0"
 dependencies = [
+ "lumen-config",
  "lumen-core",
  "lumen-format",
  "lumen-tensor",
+ "serde_json",
 ]
 
 [[package]]
@@ -334,6 +340,7 @@ dependencies = [
  "lumen-backend",
  "lumen-core",
  "lumen-ltq",
+ "lumen-mem",
  "lumen-tensor",
 ]
 

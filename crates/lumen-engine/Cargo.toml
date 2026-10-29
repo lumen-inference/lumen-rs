@@ -14,3 +14,6 @@ lumen-chat.workspace = true
 
 [features]
 cuda = ["dep:lumen-cuda"]
+
+[lints]
+workspace = true
