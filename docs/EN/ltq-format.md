@@ -136,7 +136,7 @@ Each quantized matrix `{p}` (the original tensor name without `.weight`) is stor
 
 | Tensor Name | Dtype & Shape | Contents |
 | :--- | :--- | :--- |
-| **`{p}.ltq.slices`** | `int32`, $[S, 4]$ | Descriptor for each of the $S$ slices: `[start_row, end_row, format_id, byte_offset]` |
+| **`{p}.ltq.slices`** | `int64`, $[S, 4]$ | Descriptor for each of the $S$ slices: `[start_row, end_row, format_id, byte_offset]` |
 | **`{p}.ltq.data`** | `uint8`, $[\text{bytes}]$ | Concatenated slice payload bytes |
 | **`{p}.ltq.d_row`** | `fp16`, $[M]$ | Per-row scales |
 | **`{p}.ltq.e`** | `int8`, $[M, K/256]$ | Per-block scale exponents in $[-16, 15]$ |

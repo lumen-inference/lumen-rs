@@ -72,11 +72,11 @@ flowchart TD
 | :--- | :--- | :--- |
 | **`lumen-core`** | Базовые типы: `DType`, формы тензоров `Shape`, идентификаторы устройств `Device`, мест хранения `MemLoc`, пути компонентов `ComponentPath`, типы ошибок | `half`, `bytemuck`, `thiserror` |
 | **`lumen-kabi`** | `#[repr(C)]`-структуры параметров ядер и константы форматов. Из этого крейта `cbindgen` генерирует заголовок `lumen_kabi.h` для C++/CUDA-кода | — |
-| **`lumen-config`** | Парсинг JSON-конфига, разрешение каскада и селекторов слоёв, валидация → сборка плоского плана `PlacementPlan` | `serde`, `serde_json`, `strsim` |
+| **`lumen-config`** | Парсинг JSON-конфига, разрешение каскада и селекторов слоёв, валидация → сборка плоского плана `PlacementPlan` | `lumen-core`, `serde`, `serde_json` |
 | **`lumen-mem`** | Владение памятью (`Buffer`), трейт аллокатора, арены активаций, страничный пул KV-кэша, пул рекуррентных состояний, привязка к NUMA и чтение с диска | `memmap2`, `libc`, `io-uring` |
 | **`lumen-tensor`** | Дескрипторы тензоров (`TensorRef`, `TensorView`) и канонические виды весов: `LtqLinear`, `RowTable`, `DenseLinear`, `ExpertBank` | `lumen-core`, `lumen-mem` |
+| **`lumen-ltq`** | Эталонный декодер формата LTQ на Rust (по [спецификации](ltq-format.md)) и преобразование Адамара-256 для верификации быстрых ядер | `lumen-core`, `lumen-kabi`, `half` |
 | **`lumen-format`** | Чтение контейнера `.ltq` (заголовок, таблица тензоров, `mmap`) и чтение исходных чекпойнтов `safetensors` для квантователя | `safetensors`, `memmap2`, `hf-hub` |
-| **`lumen-ltq`** | Эталонный декодер формата LTQ на Rust (по [спецификации](ltq-format.md)) и преобразование Адамара-256 для верификации быстрых ядер | `lumen-core`, `half` |
 | **`lumen-backend`** | Набор элементарных операторов `enum Op`, интерфейс бэкенда `trait Executor`, профиль железа `HwProfile` | `lumen-tensor` |
 | **`lumen-ref`** | Эталонный скалярный бэкенд на `f32`: исполняет любую `Program` и служит оракулом точности для дифференциальных тестов | `lumen-backend`, `lumen-ltq` |
 | **`lumen-cpu`** | Вычислительный бэкенд CPU: спин-пул горячего пути, SIMD-ядра на AVX2 и AVX-512, CPU-сторона пересылок `Transfer` и `Fetch` | `lumen-backend`, `lumen-ltq`, `rayon` |

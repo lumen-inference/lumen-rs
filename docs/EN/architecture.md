@@ -72,11 +72,11 @@ The workspace consists of 20 crates with a strict unidirectional dependency grap
 | :--- | :--- | :--- |
 | **`lumen-core`** | Core types: `DType`, tensor `Shape`, `Device` IDs, storage locations `MemLoc`, `ComponentPath`, error types | `half`, `bytemuck`, `thiserror` |
 | **`lumen-kabi`** | `#[repr(C)]` kernel parameter structs and format constants. `cbindgen` generates `lumen_kabi.h` from this crate for C++/CUDA code | — |
-| **`lumen-config`** | JSON config parsing, cascade and layer-selector resolution, validation → flat `PlacementPlan` | `serde`, `serde_json`, `strsim` |
+| **`lumen-config`** | JSON config parsing, cascade and layer-selector resolution, validation → flat `PlacementPlan` | `lumen-core`, `serde`, `serde_json` |
 | **`lumen-mem`** | Memory ownership (`Buffer`), allocator trait, activation arenas, paged KV pool, recurrent state pool, NUMA binding, and disk reads | `memmap2`, `libc`, `io-uring` |
 | **`lumen-tensor`** | Tensor descriptors (`TensorRef`, `TensorView`) and canonical weight descriptors: `LtqLinear`, `RowTable`, `DenseLinear`, `ExpertBank` | `lumen-core`, `lumen-mem` |
+| **`lumen-ltq`** | Reference LTQ decoder in Rust ([per specification](ltq-format.md)) and Hadamard-256 transform for verifying fast kernels | `lumen-core`, `lumen-kabi`, `half` |
 | **`lumen-format`** | Reading `.ltq` containers (header, tensor catalog, `mmap`) and reading BF16 `safetensors` checkpoints for the quantizer | `safetensors`, `memmap2`, `hf-hub` |
-| **`lumen-ltq`** | Reference LTQ decoder in Rust ([per specification](ltq-format.md)) and Hadamard-256 transform for verifying fast kernels | `lumen-core`, `half` |
 | **`lumen-backend`** | Primitive operator set `enum Op`, backend interface `trait Executor`, hardware profile `HwProfile` | `lumen-tensor` |
 | **`lumen-ref`** | Reference scalar `f32` backend capable of running any `Program`; serves as the accuracy oracle for differential tests | `lumen-backend`, `lumen-ltq` |
 | **`lumen-cpu`** | CPU compute backend: hot-path spin pool, AVX2 and AVX-512 SIMD kernels, CPU side of `Transfer` and `Fetch` | `lumen-backend`, `lumen-ltq`, `rayon` |

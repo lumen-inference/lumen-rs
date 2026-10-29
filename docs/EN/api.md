@@ -36,7 +36,7 @@ All metadata required for prompt formatting is stored directly inside the `.ltq`
 | **`lumen run`** | Single-prompt generation (`lumen run -c cfg.json -p "…"`). Runs the `Engine::step()` loop synchronously on the main thread, flushing `stdout` after each token. |
 | **`lumen chat`** | Interactive multi-turn terminal chat preserving the KV prefix cache across turns. |
 | **`lumen serve`** | Starts the HTTP server using parameters from the config's `server` section. |
-| **`lumen inspect`** | Prints the resolved per-layer `PlacementPlan` with the JSON rule source for every value, memory usage by device and class (weights, KV per token, state per sequence), per-token resource byte counts, and both hardware step ceilings ([performance.md](performance.md)). |
+| **`lumen inspect`** | Prints the resolved per-layer `PlacementPlan` with the JSON rule source for every value, memory usage by device and class (weights, KV per token, state per sequence), per-token resource byte counts, and both hardware step ceilings ([performance.md](performance.md)). `--model-config <config.json>` takes the architecture from a HuggingFace `config.json` instead of the `.ltq` file, so a placement can be inspected before the model is quantized. |
 | **`lumen probe`** | Measures hardware bandwidths and latencies and saves the profile to `hw-profile.json`. |
 | **`lumen bench`** | Measures prompt processing (`pp`) and token generation (`tg`) throughput in tokens/s along with hardware efficiency $\eta$ per step, resource, and segment; `--trace` writes a Chrome Trace timeline. |
 | **`lumen pack`** | Repacks `.ltq` model weights into target backend layouts (`CpuBand16` / `GpuWarp`) on disk ([Section 6 of architecture.md](architecture.md#6-weight-representations-and-model-loading)). |
