@@ -35,10 +35,26 @@ pub enum MemoryClass {
 }
 
 /// Rounds `size` up to the next multiple of `align` (`align` must be a power of two).
+/// Returns `None` if the result does not fit in `usize`.
+#[inline]
+pub const fn checked_align_up(size: usize, align: usize) -> Option<usize> {
+    debug_assert!(align.is_power_of_two());
+    match size.checked_add(align - 1) {
+        Some(v) => Some(v & !(align - 1)),
+        None => None,
+    }
+}
+
+/// Rounds `size` up to the next multiple of `align` (`align` must be a power of two).
+///
+/// # Panics
+/// Panics on `usize` overflow; use [`checked_align_up`] for sizes derived from untrusted input.
 #[inline]
 pub const fn align_up(size: usize, align: usize) -> usize {
-    debug_assert!(align.is_power_of_two());
-    (size + align - 1) & !(align - 1)
+    match checked_align_up(size, align) {
+        Some(v) => v,
+        None => panic!("align_up overflow"),
+    }
 }
 
 // ============================================================================
@@ -184,7 +200,7 @@ impl Buffer {
     pub fn host_slice(&self) -> Option<&[u8]> {
         match self {
             Self::Host(b) => Some(b.as_slice()),
-            Self::Mmap { mmap, offset, len } => mmap.get(*offset..(*offset + *len)),
+            Self::Mmap { mmap, offset, len } => mmap.get(*offset..offset.checked_add(*len)?),
             Self::Device { .. } => None,
         }
     }
@@ -207,6 +223,7 @@ pub struct ActivationInterval {
 #[derive(Clone, Debug)]
 pub struct ArenaLayout {
     pub total_bytes: usize,
+    /// `(id, byte_offset, byte_size)`, sorted by `id`.
     pub offsets: Vec<(BufferId, usize, usize)>,
 }
 
@@ -214,9 +231,9 @@ impl ArenaLayout {
     /// Looks up `(byte_offset, byte_size)` for `id`.
     pub fn get(&self, id: BufferId) -> Option<(usize, usize)> {
         self.offsets
-            .iter()
-            .find(|&&(bid, _, _)| bid == id)
-            .map(|&(_, off, sz)| (off, sz))
+            .binary_search_by_key(&id, |&(bid, _, _)| bid)
+            .ok()
+            .map(|i| (self.offsets[i].1, self.offsets[i].2))
     }
 }
 
@@ -231,101 +248,105 @@ pub struct ArenaPlanner {
 
 impl ArenaPlanner {
     pub fn new() -> Self {
-        Self {
-            intervals: Vec::new(),
-        }
+        Self::default()
     }
 
+    /// Registers a buffer that is live during ops `first_op..=last_op`.
+    ///
+    /// # Errors
+    /// Fails on a duplicate `id`, on `last_op < first_op` (a planner bug upstream, not something
+    /// to paper over) and on sizes whose aligned value overflows `usize`.
     pub fn add_buffer(
         &mut self,
         id: BufferId,
         byte_size: usize,
         first_op: usize,
         last_op: usize,
-    ) {
+    ) -> Result<()> {
+        if last_op < first_op {
+            return Err(LumenError::Memory(format!(
+                "buffer {} has last_op {last_op} < first_op {first_op}",
+                id.0
+            )));
+        }
+        if self.intervals.iter().any(|i| i.id == id) {
+            return Err(LumenError::Memory(format!("duplicate buffer id {}", id.0)));
+        }
+        let byte_size = checked_align_up(byte_size, MEM_ALIGN)
+            .ok_or_else(|| LumenError::Memory(format!("buffer {} size overflows", id.0)))?;
         self.intervals.push(ActivationInterval {
             id,
-            byte_size: align_up(byte_size, MEM_ALIGN),
+            byte_size,
             first_op,
-            last_op: last_op.max(first_op),
+            last_op,
         });
+        Ok(())
     }
 
-    /// Computes a static `ArenaLayout` using greedy best-fit free-block reuse sorted by size.
-    pub fn compile(&self) -> ArenaLayout {
-        // Sort intervals by descending aligned byte size (then by start time) for tight packing
+    /// Computes a static `ArenaLayout`: buffers are visited from largest to smallest and each one
+    /// takes the lowest aligned offset that does not collide with any buffer that is live at the
+    /// same time (greedy first-fit by size, as in interval-coloring allocators).
+    ///
+    /// # Errors
+    /// Fails if the total arena size overflows `usize`.
+    pub fn compile(&self) -> Result<ArenaLayout> {
+        let overflow = || LumenError::Memory("arena size overflows usize".to_string());
+
         let mut sorted = self.intervals.clone();
         sorted.sort_by(|a, b| {
             b.byte_size
                 .cmp(&a.byte_size)
                 .then_with(|| a.first_op.cmp(&b.first_op))
+                .then_with(|| a.id.cmp(&b.id))
         });
 
-        struct Placed {
-            id: BufferId,
-            offset: usize,
-            size: usize,
-            first_op: usize,
-            last_op: usize,
-        }
-
-        let mut placed: Vec<Placed> = Vec::with_capacity(sorted.len());
+        let mut placed: Vec<(ActivationInterval, usize)> = Vec::with_capacity(sorted.len());
         let mut occupied: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
         let mut total_bytes = 0usize;
 
         for item in sorted {
             if item.byte_size == 0 {
-                placed.push(Placed {
-                    id: item.id,
-                    offset: 0,
-                    size: 0,
-                    first_op: item.first_op,
-                    last_op: item.last_op,
-                });
+                placed.push((item, 0));
                 continue;
             }
 
-            // Collect occupied `[offset, offset + size)` ranges that overlap in time with `item`
+            // `[start, end)` ranges of already placed buffers whose lifetime overlaps `item`.
             occupied.clear();
             occupied.extend(
                 placed
                     .iter()
-                    .filter(|p| {
-                        p.size > 0 && !(p.last_op < item.first_op || item.last_op < p.first_op)
+                    .filter(|(p, _)| {
+                        p.byte_size > 0 && p.first_op <= item.last_op && item.first_op <= p.last_op
                     })
-                    .map(|p| (p.offset, p.offset + p.size)),
+                    .map(|(p, off)| (*off, *off + p.byte_size)),
             );
             occupied.sort_unstable_by_key(|&(start, _)| start);
 
-            // Find the lowest aligned gap >= item.byte_size
-            let mut candidate_offset = 0usize;
+            let mut candidate = 0usize;
             for &(occ_start, occ_end) in &occupied {
-                if candidate_offset + item.byte_size <= occ_start {
+                let end = candidate.checked_add(item.byte_size).ok_or_else(overflow)?;
+                if end <= occ_start {
                     break;
                 }
-                candidate_offset = candidate_offset.max(align_up(occ_end, MEM_ALIGN));
+                candidate =
+                    candidate.max(checked_align_up(occ_end, MEM_ALIGN).ok_or_else(overflow)?);
             }
 
-            total_bytes = total_bytes.max(candidate_offset + item.byte_size);
-            placed.push(Placed {
-                id: item.id,
-                offset: candidate_offset,
-                size: item.byte_size,
-                first_op: item.first_op,
-                last_op: item.last_op,
-            });
+            let end = candidate.checked_add(item.byte_size).ok_or_else(overflow)?;
+            total_bytes = total_bytes.max(end);
+            placed.push((item, candidate));
         }
 
-        placed.sort_by_key(|p| p.id.0);
+        placed.sort_by_key(|(p, _)| p.id);
         let offsets = placed
             .into_iter()
-            .map(|p| (p.id, p.offset, p.size))
+            .map(|(p, off)| (p.id, off, p.byte_size))
             .collect();
 
-        ArenaLayout {
+        Ok(ArenaLayout {
             total_bytes,
             offsets,
-        }
+        })
     }
 }
 
@@ -351,7 +372,8 @@ pub struct KvLayerSpec {
     pub head_dim: usize,
     pub mode: KvLayoutMode,
     /// Optional sliding window size $W$. When `Some(w)`, the ring holds $W + T_{\max} - 1$ tokens.
-    pub sliding_window: Option<usize>,
+    /// `u32`, like `sliding_window` in `lumen_backend::Op::Attention`.
+    pub sliding_window: Option<u32>,
 }
 
 impl KvLayerSpec {
@@ -362,21 +384,44 @@ impl KvLayerSpec {
             return 0;
         }
         match self.sliding_window {
-            Some(w) => (w + t_max.saturating_sub(1)).min(max_context),
+            Some(w) => (w as usize)
+                .saturating_add(t_max.saturating_sub(1))
+                .min(max_context),
             None => max_context,
         }
     }
 
     /// Total bytes required for this layer's KV cache for one sequence.
-    pub fn sequence_bytes(&self, max_context: usize, t_max: usize) -> usize {
-        let tokens = self.effective_token_capacity(max_context, t_max);
-        let elems_per_tok = self.num_kv_heads * self.head_dim;
+    ///
+    /// Layers with a sliding window use a ring buffer and are sized exactly; full-attention layers
+    /// live in the paged pool and are rounded up to whole [`KV_PAGE_TOKENS`]-token pages.
+    ///
+    /// The result does not include the scale/zero-point metadata of quantized KV (its layout is
+    /// not fixed yet).
+    ///
+    /// # Errors
+    /// Fails if the size does not fit in `usize`.
+    pub fn sequence_bytes(&self, max_context: usize, t_max: usize) -> Result<usize> {
+        let overflow = || LumenError::Memory("KV cache size overflows usize".to_string());
+
+        let mut tokens = self.effective_token_capacity(max_context, t_max);
+        if self.sliding_window.is_none() && tokens > 0 {
+            tokens = checked_align_up(tokens, KV_PAGE_TOKENS).ok_or_else(overflow)?;
+        }
+        let elems_per_tok = self
+            .num_kv_heads
+            .checked_mul(self.head_dim)
+            .ok_or_else(overflow)?;
         let bits_per_elem = match self.mode {
             KvLayoutMode::Standard { k_bits, v_bits } => usize::from(k_bits) + usize::from(v_bits),
             KvLayoutMode::SharedKV { v_bits } => usize::from(v_bits),
             KvLayoutMode::ExternalRef { .. } => 0,
         };
-        align_up((tokens * elems_per_tok * bits_per_elem).div_ceil(8), MEM_ALIGN)
+        let bits = tokens
+            .checked_mul(elems_per_tok)
+            .and_then(|v| v.checked_mul(bits_per_elem))
+            .ok_or_else(overflow)?;
+        checked_align_up(bits.div_ceil(8), MEM_ALIGN).ok_or_else(overflow)
     }
 }
 
@@ -392,9 +437,21 @@ pub struct StateLayerSpec {
 }
 
 impl StateLayerSpec {
-    pub const fn total_slot_bytes(&self) -> usize {
-        let single = align_up(self.matrix_bytes + self.conv_bytes, MEM_ALIGN);
-        single * if self.history_slots == 0 { 1 } else { self.history_slots }
+    /// Bytes for one sequence slot including all rollback history slots (at least one).
+    /// Returns `None` on `usize` overflow.
+    pub const fn total_slot_bytes(&self) -> Option<usize> {
+        let Some(sum) = self.matrix_bytes.checked_add(self.conv_bytes) else {
+            return None;
+        };
+        let Some(single) = checked_align_up(sum, MEM_ALIGN) else {
+            return None;
+        };
+        let slots = if self.history_slots == 0 {
+            1
+        } else {
+            self.history_slots
+        };
+        single.checked_mul(slots)
     }
 }
 
@@ -415,13 +472,13 @@ mod tests {
     fn test_arena_planner_reuses_disjoint_intervals() {
         let mut planner = ArenaPlanner::new();
         // Buffer 0 lives in ops 0..=2 (1024 bytes)
-        planner.add_buffer(BufferId(0), 1024, 0, 2);
+        planner.add_buffer(BufferId(0), 1024, 0, 2).unwrap();
         // Buffer 1 lives in ops 1..=3 (1024 bytes) -> overlaps with Buffer 0
-        planner.add_buffer(BufferId(1), 1024, 1, 3);
+        planner.add_buffer(BufferId(1), 1024, 1, 3).unwrap();
         // Buffer 2 lives in ops 3..=5 (1024 bytes) -> disjoint from Buffer 0, can reuse offset 0!
-        planner.add_buffer(BufferId(2), 1024, 3, 5);
+        planner.add_buffer(BufferId(2), 1024, 3, 5).unwrap();
 
-        let layout = planner.compile();
+        let layout = planner.compile().unwrap();
         assert_eq!(layout.total_bytes, 2048);
         let (off0, _) = layout.get(BufferId(0)).unwrap();
         let (off1, _) = layout.get(BufferId(1)).unwrap();
@@ -461,8 +518,110 @@ mod tests {
             sliding_window: None,
         };
         assert_eq!(
-            std_full.sequence_bytes(4096, 1),
-            shared_kv.sequence_bytes(4096, 1) * 2
+            std_full.sequence_bytes(4096, 1).unwrap(),
+            shared_kv.sequence_bytes(4096, 1).unwrap() * 2
         );
+    }
+
+    #[test]
+    fn test_kv_sequence_bytes_page_rounding_and_overflow() {
+        let full = KvLayerSpec {
+            num_kv_heads: 1,
+            head_dim: 8,
+            mode: KvLayoutMode::Standard {
+                k_bits: 8,
+                v_bits: 8,
+            },
+            sliding_window: None,
+        };
+        // 65 tokens occupy two 64-token pages: 128 tokens * 8 elems * 16 bits = 2048 B
+        assert_eq!(full.sequence_bytes(65, 1).unwrap(), 2048);
+
+        let huge = KvLayerSpec {
+            num_kv_heads: usize::MAX,
+            head_dim: 2,
+            ..full
+        };
+        assert!(huge.sequence_bytes(4096, 1).is_err());
+        assert!(full.sequence_bytes(usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn test_state_slot_bytes() {
+        let s = StateLayerSpec {
+            matrix_bytes: 3_145_728,
+            conv_bytes: 100,
+            history_slots: 0,
+        };
+        assert_eq!(s.total_slot_bytes(), Some(3_145_728 + 256));
+        let s = StateLayerSpec {
+            history_slots: 4,
+            ..s
+        };
+        assert_eq!(s.total_slot_bytes(), Some((3_145_728 + 256) * 4));
+        let s = StateLayerSpec {
+            matrix_bytes: usize::MAX,
+            conv_bytes: 1,
+            history_slots: 1,
+        };
+        assert_eq!(s.total_slot_bytes(), None);
+    }
+
+    #[test]
+    fn test_arena_planner_rejects_bad_buffers() {
+        let mut p = ArenaPlanner::new();
+        p.add_buffer(BufferId(0), 10, 0, 1).unwrap();
+        assert!(p.add_buffer(BufferId(0), 10, 0, 1).is_err(), "duplicate id");
+        assert!(
+            p.add_buffer(BufferId(1), 10, 5, 2).is_err(),
+            "inverted lifetime"
+        );
+        assert!(
+            p.add_buffer(BufferId(2), usize::MAX, 0, 1).is_err(),
+            "size overflow"
+        );
+    }
+
+    #[test]
+    fn test_arena_never_overlaps_live_buffers() {
+        // Pseudo-random intervals; verify the invariant instead of specific offsets.
+        let mut x = 12345u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut planner = ArenaPlanner::new();
+        let mut specs = Vec::new();
+        for i in 0..200u32 {
+            let first = (next() % 50) as usize;
+            let last = first + (next() % 10) as usize;
+            let size = (next() % 5000) as usize;
+            planner.add_buffer(BufferId(i), size, first, last).unwrap();
+            specs.push((BufferId(i), first, last));
+        }
+        let layout = planner.compile().unwrap();
+        for (i, &(a, a0, a1)) in specs.iter().enumerate() {
+            let (ao, asz) = layout.get(a).unwrap();
+            assert_eq!(ao % MEM_ALIGN, 0);
+            assert!(ao + asz <= layout.total_bytes);
+            for &(b, b0, b1) in &specs[i + 1..] {
+                let (bo, bsz) = layout.get(b).unwrap();
+                let live_together = a0 <= b1 && b0 <= a1;
+                let disjoint = ao + asz <= bo || bo + bsz <= ao;
+                assert!(
+                    !live_together || asz == 0 || bsz == 0 || disjoint,
+                    "{a:?} overlaps {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_checked_align_up() {
+        assert_eq!(checked_align_up(1, 256), Some(256));
+        assert_eq!(checked_align_up(256, 256), Some(256));
+        assert_eq!(checked_align_up(usize::MAX, 256), None);
     }
 }

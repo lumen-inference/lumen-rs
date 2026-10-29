@@ -66,6 +66,16 @@ pub struct LtqSliceAbi {
     pub row_end: u32,
     /// Format index in the container's `formats` table.
     pub format_idx: u32,
+    /// Explicit padding so that `byte_offset` is 8-byte aligned on every compiler; must be 0.
+    pub _pad: u32,
     /// Byte offset of this slice's packed data inside `{p}.ltq.data`.
+    ///
+    /// 64-bit: a single matrix may exceed 2 GiB even when quantized.
     pub byte_offset: u64,
 }
+
+// Layout guards: the `.cu` side relies on these exact sizes (checked again against the generated
+// `lumen_kabi.h` in CI).
+const _: () = assert!(core::mem::size_of::<LtqSliceAbi>() == 24);
+const _: () = assert!(core::mem::align_of::<LtqSliceAbi>() == 8);
+const _: () = assert!(core::mem::size_of::<LtqFormatAbi>() == 32);
