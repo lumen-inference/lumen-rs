@@ -90,7 +90,6 @@ pub fn architecture_from_config(config: &Value) -> Result<Box<dyn Architecture>>
         })?;
     let mut layout = (family.parse)(&cfg)?;
     layout.name = family.name.to_string();
-    layout.validate()?;
     Ok(Box::new(ConfiguredArchitecture { layout }))
 }
 

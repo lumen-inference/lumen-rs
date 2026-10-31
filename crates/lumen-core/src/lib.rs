@@ -586,7 +586,7 @@ impl LayerMask {
 }
 
 /// Classification of a leaf component in a `ComponentTree`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum ComponentKind {
     /// Dense matrix or weight tensor accessed in full during forward pass.
     DenseWeight,
@@ -638,13 +638,35 @@ impl ComponentKind {
     }
 }
 
-/// Metadata for a single leaf component in `ComponentTree`.
+/// Metadata for a global leaf component in `ComponentTree`.
 #[derive(Clone, Debug)]
 pub struct ComponentLeaf {
     pub path: ComponentPath,
     pub kind: ComponentKind,
-    /// Layer indices `[0, num_layers)` where this component exists (empty for globals).
-    pub active_layers: LayerMask,
+}
+
+/// A component path whose kind can vary between decoder layers.
+///
+/// Each kind has a disjoint set of layers. Registration through [`ComponentTree::add_layer`]
+/// checks this invariant; consumers must resolve the kind for the layer they are processing.
+#[derive(Clone, Debug)]
+pub struct LayerComponentLeaf {
+    pub path: ComponentPath,
+    kinds: BTreeMap<ComponentKind, LayerMask>,
+}
+
+impl LayerComponentLeaf {
+    /// The component's kind on `layer`, or `None` if it is absent from that layer.
+    pub fn kind_at(&self, layer: usize) -> Option<ComponentKind> {
+        self.kinds
+            .iter()
+            .find_map(|(&kind, mask)| mask.contains(layer).then_some(kind))
+    }
+
+    /// All kinds registered for this path (each has at least one active layer).
+    pub fn kinds(&self) -> impl Iterator<Item = ComponentKind> + '_ {
+        self.kinds.keys().copied()
+    }
 }
 
 /// Model component hierarchy produced by `Architecture::components()`.
@@ -655,7 +677,7 @@ pub struct ComponentTree {
     /// Global (non-layer) leaf components (e.g. `input-layer`, `ple/table`, `output-layer/lm-head`).
     pub global_leaves: BTreeMap<ComponentPath, ComponentLeaf>,
     /// Per-layer leaf components relative to `hidden-layers/` (e.g. `attention/q`, `moe/routed-experts`).
-    pub layer_leaves: BTreeMap<ComponentPath, ComponentLeaf>,
+    pub layer_leaves: BTreeMap<ComponentPath, LayerComponentLeaf>,
     /// All valid intermediate directory prefixes for global nodes.
     pub global_prefixes: BTreeSet<ComponentPath>,
     /// All valid intermediate directory prefixes under `hidden-layers/`.
@@ -678,33 +700,54 @@ impl ComponentTree {
     pub fn add_global(&mut self, path: impl Into<ComponentPath>, kind: ComponentKind) {
         let path = path.into();
         self.register_prefixes(&path, false);
-        self.global_leaves.insert(
-            path.clone(),
-            ComponentLeaf {
-                path,
-                kind,
-                active_layers: LayerMask::empty(),
-            },
-        );
+        self.global_leaves
+            .insert(path.clone(), ComponentLeaf { path, kind });
     }
 
     /// Registers a per-layer leaf component active on `mask` and all its parent prefixes.
+    /// Repeated registrations of the same kind are merged; different kinds may share a path
+    /// only on disjoint layers. Empty masks are ignored.
+    ///
+    /// # Errors
+    /// Returns an error without changing the tree if a layer is out of range or already has
+    /// a different kind at this path.
     pub fn add_layer(
         &mut self,
         path: impl Into<ComponentPath>,
         kind: ComponentKind,
         mask: LayerMask,
-    ) {
+    ) -> Result<()> {
         let path = path.into();
+        if mask.is_empty() {
+            return Ok(());
+        }
+        for layer in mask.iter() {
+            if layer >= self.num_hidden_layers {
+                return Err(LumenError::Config(format!(
+                    "component '{path}' references layer {layer} outside model range [0, {})",
+                    self.num_hidden_layers
+                )));
+            }
+            if let Some(existing) = self.layer_leaves.get(&path).and_then(|l| l.kind_at(layer))
+                && existing != kind
+            {
+                return Err(LumenError::Config(format!(
+                    "component '{path}' has conflicting kinds {existing:?} and {kind:?} on layer {layer}"
+                )));
+            }
+        }
         self.register_prefixes(&path, true);
         self.layer_leaves
             .entry(path.clone())
-            .and_modify(|leaf| leaf.active_layers.union_with(&mask))
-            .or_insert(ComponentLeaf {
+            .or_insert_with(|| LayerComponentLeaf {
                 path,
-                kind,
-                active_layers: mask,
-            });
+                kinds: BTreeMap::new(),
+            })
+            .kinds
+            .entry(kind)
+            .or_default()
+            .union_with(&mask);
+        Ok(())
     }
 
     fn register_prefixes(&mut self, path: &ComponentPath, is_layer: bool) {
@@ -734,6 +777,82 @@ impl ComponentTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layer_component_kinds_merge_without_losing_layers() {
+        let mut tree = ComponentTree::new("mixed", 131);
+        tree.add_layer(
+            "cache",
+            ComponentKind::KvCache,
+            LayerMask::from_fn(131, |l| l == 0 || l == 64),
+        )
+        .unwrap();
+        tree.add_layer(
+            "cache",
+            ComponentKind::SparseKvCache,
+            LayerMask::from_fn(131, |l| l == 130),
+        )
+        .unwrap();
+        // Same-kind overlap is idempotent and can add another layer.
+        tree.add_layer(
+            "cache",
+            ComponentKind::KvCache,
+            LayerMask::from_fn(131, |l| l == 64 || l == 129),
+        )
+        .unwrap();
+        let leaf = &tree.layer_leaves[&ComponentPath::new("cache")];
+        for layer in [0, 64, 129] {
+            assert_eq!(leaf.kind_at(layer), Some(ComponentKind::KvCache));
+        }
+        assert_eq!(leaf.kind_at(130), Some(ComponentKind::SparseKvCache));
+        assert_eq!(leaf.kind_at(1), None);
+        assert_eq!(leaf.kind_at(131), None);
+    }
+
+    #[test]
+    fn conflicting_layer_registration_is_atomic() {
+        let mut tree = ComponentTree::new("mixed", 131);
+        let path = ComponentPath::new("attention/kv-cache");
+        tree.add_layer(
+            path.clone(),
+            ComponentKind::KvCache,
+            LayerMask::from_fn(131, |l| l == 130),
+        )
+        .unwrap();
+        let err = tree
+            .add_layer(
+                path.clone(),
+                ComponentKind::SparseKvCache,
+                LayerMask::from_fn(131, |l| l == 0 || l == 130),
+            )
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("attention/kv-cache") && message.contains("130"),
+            "{message}"
+        );
+        let leaf = &tree.layer_leaves[&path];
+        assert_eq!(
+            leaf.kind_at(0),
+            None,
+            "failed registration must not add earlier layers"
+        );
+        assert_eq!(leaf.kind_at(130), Some(ComponentKind::KvCache));
+    }
+
+    #[test]
+    fn out_of_range_and_empty_registrations_do_not_change_the_tree() {
+        let mut tree = ComponentTree::new("empty", 2);
+        let path = ComponentPath::new("attention/kv-cache");
+        assert!(
+            tree.add_layer(path.clone(), ComponentKind::KvCache, LayerMask::all(3))
+                .is_err()
+        );
+        tree.add_layer(path, ComponentKind::KvCache, LayerMask::empty())
+            .unwrap();
+        assert!(tree.layer_leaves.is_empty());
+        assert!(tree.layer_prefixes.is_empty());
+    }
 
     #[test]
     fn test_device_and_memloc_parsing() {

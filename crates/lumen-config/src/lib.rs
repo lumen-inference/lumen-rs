@@ -868,8 +868,7 @@ impl RuntimeConfig {
                     for (p, r) in &parsed_sel_rules {
                         let applies_on_layer = p.is_empty()
                             || tree.layer_leaves.values().any(|leaf| {
-                                leaf.path.starts_with_path(p)
-                                    && leaf.active_layers.contains(layer_idx)
+                                leaf.path.starts_with_path(p) && leaf.kind_at(layer_idx).is_some()
                             });
                         if !applies_on_layer {
                             let skip_msg = format!(
@@ -914,9 +913,9 @@ impl RuntimeConfig {
 
         for layer_idx in 0..tree.num_hidden_layers {
             for (path, leaf) in &tree.layer_leaves {
-                if !leaf.active_layers.contains(layer_idx) {
+                let Some(kind) = leaf.kind_at(layer_idx) else {
                     continue;
-                }
+                };
                 let mut resolved = PartialPlace {
                     compute: Some(base_compute.clone()),
                     store: Some(base_store.clone()),
@@ -937,14 +936,14 @@ impl RuntimeConfig {
                 }
 
                 let (place, origin) = finalize_place(resolved);
-                if leaf.kind.is_kv_cache() {
+                if kind.is_kv_cache() {
                     kv.push(KvPlacement {
                         layer: layer_idx,
                         place,
                         k_bits: self.kv_quantization.map(|q| q.k_bits),
                         v_bits: self.kv_quantization.map(|q| q.v_bits),
                     });
-                } else if leaf.kind == ComponentKind::RecurrentState {
+                } else if kind == ComponentKind::RecurrentState {
                     state.push(StatePlacement {
                         layer: layer_idx,
                         place,
@@ -1032,9 +1031,9 @@ fn collect_subtree_rules(
     let partial = extract_partial_place(obj, origin)?;
     let exists_in_tree = current_path.is_empty()
         || if is_layer {
-            tree.layer_leaves.values().any(|leaf| {
-                leaf.path.starts_with_path(current_path) && !leaf.active_layers.is_empty()
-            })
+            tree.layer_leaves
+                .values()
+                .any(|leaf| leaf.path.starts_with_path(current_path))
         } else {
             tree.is_valid_global_path(current_path)
         };
@@ -1197,7 +1196,9 @@ impl PlacementPlan {
             let _ = writeln!(out, "  {}", "-".repeat(114));
 
             for (path, place) in &self.layers[map_idx] {
-                let leaf = &self.tree.layer_leaves[path];
+                let kind = self.tree.layer_leaves[path]
+                    .kind_at(map_idx)
+                    .expect("resolved placement refers to an active component");
                 let prefill_str = place
                     .prefill_compute
                     .map_or_else(|| "-".to_string(), |d| d.to_string());
@@ -1208,8 +1209,8 @@ impl PlacementPlan {
                     place.store.to_string(),
                     place.compute.to_string(),
                     prefill_str,
-                    place.decode_access_mode(leaf.kind).as_str(),
-                    place.prefill_access_mode(leaf.kind).as_str(),
+                    place.decode_access_mode(kind).as_str(),
+                    place.prefill_access_mode(kind).as_str(),
                     self.provenance.layer_origins[map_idx][path].summary()
                 );
             }
@@ -1238,6 +1239,10 @@ impl PlacementPlan {
             let found = groups.iter_mut().find(|(_, rep)| {
                 self.layers[*rep] == self.layers[l]
                     && self.provenance.layer_origins[*rep] == self.provenance.layer_origins[l]
+                    && self.layers[l].keys().all(|path| {
+                        let leaf = &self.tree.layer_leaves[path];
+                        leaf.kind_at(*rep) == leaf.kind_at(l)
+                    })
             });
             if let Some((list, _)) = found {
                 list.push(l);
@@ -1296,6 +1301,40 @@ mod tests {
     use super::*;
     use lumen_core::LayerMask;
 
+    #[test]
+    fn inspect_does_not_group_layers_with_different_access_kinds() {
+        let cfg = RuntimeConfig::from_json_str(
+            r#"{
+            "model": {"path": "unused.ltq", "compute": "cuda:0", "store": "ram:0"}
+        }"#,
+        )
+        .unwrap();
+        // Same path and placement, different access semantics. Test both registration orders.
+        for reverse in [false, true] {
+            let mut tree = ComponentTree::new("mixed", 3);
+            let mut variants = [
+                (ComponentKind::KvCache, LayerMask::from_fn(3, |l| l != 1)),
+                (
+                    ComponentKind::SparseKvCache,
+                    LayerMask::from_fn(3, |l| l == 1),
+                ),
+            ];
+            if reverse {
+                variants.reverse();
+            }
+            for (kind, mask) in variants {
+                tree.add_layer("attention/kv-cache", kind, mask).unwrap();
+            }
+            let plan = cfg.resolve_plan(tree.clone(), &tree, true).unwrap();
+            let report = plan.format_inspect(&cfg);
+            assert!(report.contains("[Layers 0, 2]"), "{report}");
+            assert!(report.contains("[Layers 1]"), "{report}");
+            assert_eq!(report.matches("Streamed").count(), 2, "{report}");
+            assert_eq!(report.matches("ZeroCopy").count(), 2, "{report}");
+            assert_eq!(plan.kv.len(), 3);
+        }
+    }
+
     // ------------------------------------------------------------------------------------
     // Hand-built component trees. `lumen-config` must not know any model family, so the tests
     // describe the shapes they need directly (real architectures are tested in `lumen-models`).
@@ -1344,38 +1383,46 @@ mod tests {
                 t.add_global("ple/table", RowTable);
                 t.add_global("ple/projections", DenseWeight);
             }
-            t.add_layer("norms/input-norm", DenseWeight, LayerMask::all(self.layers));
+            t.add_layer("norms/input-norm", DenseWeight, LayerMask::all(self.layers))
+                .unwrap();
             for p in ["q", "k", "v", "o"] {
                 t.add_layer(
                     format!("attention/{p}"),
                     DenseWeight,
                     self.attention.clone(),
-                );
+                )
+                .unwrap();
             }
-            t.add_layer("attention/kv-cache", KvCache, self.attention.clone());
+            t.add_layer("attention/kv-cache", KvCache, self.attention.clone())
+                .unwrap();
             t.add_layer(
                 "linear-attention/projections/qkv",
                 DenseWeight,
                 self.linear_attention.clone(),
-            );
+            )
+            .unwrap();
             t.add_layer(
                 "linear-attention/state",
                 RecurrentState,
                 self.linear_attention.clone(),
-            );
+            )
+            .unwrap();
             for p in ["gate", "up", "down"] {
                 t.add_layer(
                     format!("dense-mlp/{p}"),
                     DenseWeight,
                     self.dense_mlp.clone(),
-                );
+                )
+                .unwrap();
             }
-            t.add_layer("moe/router", DenseWeight, self.moe.clone());
+            t.add_layer("moe/router", DenseWeight, self.moe.clone())
+                .unwrap();
             t.add_layer(
                 "moe/routed-experts/projections",
                 ExpertBank,
                 self.moe.clone(),
-            );
+            )
+            .unwrap();
             t
         }
     }
@@ -1388,13 +1435,15 @@ mod tests {
         t.add_layer(
             "hyper-connections",
             ComponentKind::DenseWeight,
-            LayerMask::empty(),
-        );
+            LayerMask::all(1),
+        )
+        .unwrap();
         t.add_layer(
             "attention/indexer/keys",
             ComponentKind::IndexerCache,
-            LayerMask::empty(),
-        );
+            LayerMask::all(1),
+        )
+        .unwrap();
         t.add_global("vision-tower", ComponentKind::DenseWeight);
         t
     }

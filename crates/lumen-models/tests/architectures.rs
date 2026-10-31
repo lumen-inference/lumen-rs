@@ -14,7 +14,11 @@ fn tree(config: Value) -> ComponentTree {
 fn layer_set(t: &ComponentTree, path: &str) -> Vec<usize> {
     t.layer_leaves
         .get(&ComponentPath::new(path))
-        .map(|l| l.active_layers.iter().collect())
+        .map(|leaf| {
+            (0..t.num_hidden_layers)
+                .filter(|&l| leaf.kind_at(l).is_some())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -169,10 +173,6 @@ fn qwen3_next_uses_fused_projections_and_moe_with_shared_expert() {
     );
 }
 
-fn kv_kind(t: &ComponentTree) -> ComponentKind {
-    t.layer_leaves[&ComponentPath::new("attention/kv-cache")].kind
-}
-
 #[test]
 fn only_qsa_models_have_a_sparse_kv_cache() {
     for (name, config) in all_samples() {
@@ -185,13 +185,19 @@ fn only_qsa_models_have_a_sparse_kv_cache() {
         if t.layer_leaves
             .contains_key(&ComponentPath::new("attention/kv-cache"))
         {
-            assert_eq!(kv_kind(&t), expected, "{name}");
+            for layer in layer_set(&t, "attention/kv-cache") {
+                assert_eq!(
+                    t.layer_leaves[&ComponentPath::new("attention/kv-cache")].kind_at(layer),
+                    Some(expected),
+                    "{name}: layer {layer}"
+                );
+            }
         }
     }
 }
 
 #[test]
-fn mixed_dense_and_sparse_kv_caches_are_rejected() {
+fn mixed_dense_and_sparse_kv_caches_keep_their_access_modes() {
     use lumen_models::{AttentionSpec, Ffn, LayerSpec, Layout, Mixer};
     let layer = |indexer| LayerSpec {
         mixer: Mixer::Attention(AttentionSpec {
@@ -209,13 +215,42 @@ fn mixed_dense_and_sparse_kv_caches_are_rejected() {
         audio_tower: false,
         mtp: false,
     };
-    assert!(layout(vec![layer(true), layer(true)]).validate().is_ok());
-    assert!(layout(vec![layer(false), layer(false)]).validate().is_ok());
-    let err = layout(vec![layer(true), layer(false)])
-        .validate()
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("mixed dense/sparse"), "{err}");
+    let cfg = RuntimeConfig::from_json_str(
+        r#"{
+        "model": {"path": "unused.ltq", "compute": "cuda:0", "store": "ram:0"}
+    }"#,
+    )
+    .unwrap();
+    let plan = cfg
+        .resolve_plan(
+            layout(vec![layer(false), layer(true)]).components(),
+            &known_components(),
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        plan.kv.iter().map(|kv| kv.layer).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    let report = plan.format_inspect(&cfg);
+    let dense_section = report
+        .split("[Layers 0]")
+        .nth(1)
+        .unwrap()
+        .split("[Layers 1]")
+        .next()
+        .unwrap();
+    let dense_cache = dense_section
+        .lines()
+        .find(|line| line.contains("attention/kv-cache"))
+        .unwrap();
+    assert_eq!(dense_cache.matches("Streamed").count(), 2, "{report}");
+    let sparse_section = report.split("[Layers 1]").nth(1).unwrap();
+    let sparse_cache = sparse_section
+        .lines()
+        .find(|line| line.contains("attention/kv-cache"))
+        .unwrap();
+    assert_eq!(sparse_cache.matches("ZeroCopy").count(), 2, "{report}");
 }
 
 #[test]
@@ -371,11 +406,14 @@ fn every_component_of_every_family_is_in_the_known_namespace_with_the_same_kind(
                 .layer_leaves
                 .get(path)
                 .unwrap_or_else(|| panic!("{name}: {path} unknown"));
-            // The KV cache is dense or sparse depending on the family; every other kind is fixed.
-            let same = k.kind == leaf.kind || (k.kind.is_kv_cache() && leaf.kind.is_kv_cache());
-            assert!(same, "{name}: kind of {path}");
+            for kind in leaf.kinds() {
+                assert!(
+                    k.kinds().any(|known| known == kind),
+                    "{name}: kind of {path}"
+                );
+            }
             assert!(
-                !leaf.active_layers.is_empty(),
+                !layer_set(&t, path.as_str()).is_empty(),
                 "{name}: {path} registered but never active"
             );
         }

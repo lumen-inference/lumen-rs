@@ -6,7 +6,7 @@
 //! from that single description, so model families differ only in how they *fill in* a layout,
 //! never in how a tree is built.
 
-use lumen_core::{ComponentKind, ComponentTree, LayerMask, LumenError, Result};
+use lumen_core::{ComponentKind, ComponentTree, LayerMask};
 
 /// Self-attention module (full or sliding window: the config tree does not distinguish them).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,32 +111,6 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// Checks the layout for combinations the component tree cannot express yet.
-    ///
-    /// A layer's KV cache is read densely by ordinary attention and by gather when a sparse
-    /// indexer selects blocks (`QSA`). Both live at the path `attention/kv-cache`, whose access
-    /// kind is a property of the path, so a model mixing the two is rejected rather than being
-    /// given the wrong kind for half of its layers.
-    pub fn validate(&self) -> Result<()> {
-        let (mut sparse, mut dense) = (false, false);
-        for layer in &self.layers {
-            if let Mixer::Attention(a) = &layer.mixer
-                && a.kv_cache
-            {
-                sparse |= a.indexer;
-                dense |= !a.indexer;
-            }
-        }
-        if sparse && dense {
-            return Err(LumenError::Format(
-                "model config: layers with and without a sparse-attention indexer both own a KV \
-                 cache; mixed dense/sparse KV caches are not supported"
-                    .to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     /// Builds the component tree (the config/placement namespace) for this layout.
     ///
     /// Only components that exist somewhere in the model are added; a path that exists in
@@ -171,7 +145,8 @@ impl Layout {
         let mut add = |path: &str, kind: ComponentKind, pred: &dyn Fn(&LayerSpec) -> bool| {
             let mask = LayerMask::from_fn(n, |l| pred(&self.layers[l]));
             if !mask.is_empty() {
-                tree.add_layer(path, kind, mask);
+                tree.add_layer(path, kind, mask)
+                    .expect("module builders register disjoint kinds within the layout's layers");
             }
         };
 
@@ -198,14 +173,11 @@ impl Layout {
             attn_with(l, |a| a.qk_norm)
         });
         add("attention/rope", ComputeOnly, &attn);
-        // Dense or sparse (QSA) access is a property of the path; `validate` rules out mixtures.
-        let sparse_kv = self
-            .layers
-            .iter()
-            .any(|l| matches!(&l.mixer, Mixer::Attention(a) if a.kv_cache && a.indexer));
-        let kv_kind = if sparse_kv { SparseKvCache } else { KvCache };
-        add("attention/kv-cache", kv_kind, &|l| {
-            attn_with(l, |a| a.kv_cache)
+        add("attention/kv-cache", KvCache, &|l| {
+            attn_with(l, |a| a.kv_cache && !a.indexer)
+        });
+        add("attention/kv-cache", SparseKvCache, &|l| {
+            attn_with(l, |a| a.kv_cache && a.indexer)
         });
         add("attention/indexer/keys", IndexerCache, &|l| {
             attn_with(l, |a| a.indexer)
@@ -278,6 +250,10 @@ pub(crate) fn superset_layout() -> Layout {
     Layout {
         name: "known-components".to_string(),
         layers: vec![
+            LayerSpec {
+                mixer: Mixer::Attention(AttentionSpec::standard(true)),
+                ffn,
+            },
             LayerSpec {
                 mixer: Mixer::Attention(everything),
                 ffn,
