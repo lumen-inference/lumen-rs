@@ -1,5 +1,7 @@
 # Configuration and Cascading Placement (lumen-config)
 
+**Status:** parsing, placement resolution, and `inspect` exist. Acceptance of a runtime/backend setting does not mean that its execution path is implemented or supported; see [architecture.md](architecture.md).
+
 A configuration file in `lumen-rs` is a JSON document that defines:
 1. **The model and the placement of its components across hardware devices** (`model` section).
 2. **Runtime and backend parameters**: context length, KV cache quantization, CPU and disk thread pools, CUDA prefill chunking, and HTTP server settings.

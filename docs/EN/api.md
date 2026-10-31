@@ -1,5 +1,7 @@
 # External Interfaces: Chat Layer, CLI, and HTTP Server
 
+**Status: interface proposal.** Only `inspect` is operational, reporting resolved placement, access classifications, and rule provenance. Runtime memory reports, hardware ceilings, generation, chat, serving, probing, packing, and quantization are not implemented. The command and protocol descriptions below are planned behavior, not a ready public API.
+
 The external interface layer on top of [`Engine`](architecture.md#8-generation-runtime-engine-speculative-decoding-and-multimodality) is divided into three crates:
 - **`lumen-chat`** — formats conversational messages (text, images, audio, system prompts, and tool definitions) into tokens and parses generated token streams into typed events.
 - **`lumen-cli`** — the `lumen` binary for running generation, inspecting placement plans, benchmarking hardware, and quantizing models.

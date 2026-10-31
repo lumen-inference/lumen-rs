@@ -1,47 +1,36 @@
-# Implementation Roadmap and Risk Management
+# Implementation roadmap
 
-The implementation of `lumen-rs` is structured into **10 sequential phases**: first building the placement plan, reference decoders, and a complete end-to-end CPU pipeline, and then layering CUDA kernels and hybrid offloading on top. Each phase is verified against the preceding one.
+Build a small correct execution path first, then justify additional mechanisms with measurements. The phase numbers below retain existing code references; they are milestones, not a requirement to finish every optimization before proceeding. In particular, a hybrid synchronization experiment can run alongside the first GPU work.
 
----
+**Current position:** the configuration/inspect and format/decoder foundation exists. End-to-end inference does not. The Python golden fixtures required below are still missing; Rust differential decoder tests do not replace them. See [architecture.md](architecture.md) for implemented scope and [execution-design.md](execution-design.md) for proposed mechanisms.
 
-## Phased Implementation Order
+## Milestones and acceptance
 
-1. **Phase 1 — Core Types, Config Parser, and `lumen inspect`:**
-   Implement `lumen-core`, `lumen-mem`, and `lumen-config` with flat `PlacementPlan` resolution and the `lumen inspect` command (printing the resolved placement plan before writing the first compute kernel). Build the `lumen-ref` reference executor skeleton. Enable CI architectural boundary checks ([Section 9 of architecture.md](architecture.md#9-extensibility-rules-and-architectural-boundaries)) from the first commit.
-2. **Phase 2 — `.ltq` Container, `lumen-ltq` Reference Decoder, and Quantizer Port:**
-   Implement container loading in `lumen-format` and tensor descriptors in `lumen-tensor`. Implement the `lumen-ltq` reference decoder and verify it bit-for-bit against golden fixtures from the Python prototype (`ltq-research`). In parallel, port the CUDA Viterbi and Block16-LDLQ kernels into `lumen-cuda-kernels` and implement the LDLQ loop, slice profiling, and DP allocation in Rust (`lumen-quantize`), verifying KLD parity.
-3. **Phase 3 — End-to-End CPU Pipeline (`lumen-ref` and `lumen-cpu`):**
-   Implement `LTQ GEMV` kernels, dense and hybrid modules in `lumen-models`, and the `lumen-exec` compiler. Run `lumen run` end-to-end on CPU for `Llama`, `Qwen3`, and `qwen3_5_dense`. Run differential tests via `lumen-ref`: verify logits against `transformers` on tiny random fixtures and verify logit invariance across valid `PlacementPlan` configurations.
-4. **Phase 4 — Pure GPU Pipeline (`lumen-cuda` and `lumen-cuda-kernels`):**
-   Wire up `nvcc` kernel compilation and `lumen-kabi` (`cbindgen`). Integrate paged attention on **FlashInfer** with custom variants (QSA block lists, $K = V$ reconstruction, quantized KV cache) and the `GatedDeltaNet` kernel, followed by VRAM-ceiling `LTQ GEMV` kernels and **CUDA Graphs**.
-5. **Phase 5 — Hybrid GPU ↔ CPU Offload Core and $\eta$ Benchmarking:**
-   Implement `ExpertBank`, the `Transfer` operator, the `pinned RAM` flag protocol, and the CPU spin pool. Run `qwen3_next`, `qwen3_5_moe`, `gpt-oss`, and `Qwen3-MoE` with experts offloaded to CPU. Implement `lumen probe`, `Program::floor`, and `lumen bench`.
-6. **Phase 6 — NVMe Disk Offload (`RowTable` and `Fetch`):**
-   Implement `RowTable` ring decoding, the background I/O thread pool (`io_uring` / `pread`), and ahead-of-time `Fetch` prefetching.
-7. **Phase 7 — Fast Prefill and Weight Streaming (`prefill-compute`):**
-   Implement the `reconstruct + CUTLASS GEMM` path, prompt chunking, `"prefill-compute": "cuda:0"` weight streaming reading the `CpuBand16` layout, and dead-row elimination. Add backward passes for supported blocks to compute Fisher information natively in `lumen-quantize`.
-8. **Phase 8 — Specialized Architecture Modules (`Qwen3.8-Flash-Next` and `Gemma 4`):**
-   Add `QSA`, `Hyper-Connections`, and n-gram `PLE` for `Qwen3.8-Flash-Next`, plus $K = V$, `p-RoPE`, shared KV, `PLE`, and parallel Dense MLP + MoE for `Gemma 4`. Reach the target $\eta \ge 0.85$ of the critical-path ceiling on the reference rig (~58 tokens/s at 262k context).
-9. **Phase 9 — Server Runtime, Batching, and Speculative Decoding:**
-   Implement continuous batching, `PrefixCache` with recurrent state snapshots, GPU sampling, asynchronous step pipelining, speculative drafters (`NGram`, `DraftModel`, `Mtp`, `Gemma4Assistant`), and `lumen-server` (OpenAI and Anthropic APIs).
-10. **Phase 10 — Multimodality (`lumen-media`):**
-    Implement media preprocessing in `lumen-media`, vision (ViT) and audio (Conformer) encoders, the encoder-free `Gemma 4 12B` patch embedder, and bidirectional image span masks.
-
----
-
-## Technical Risks and Mitigations
-
-| Risk | Impact | Mitigation |
+| Phase | Deliverable | Evidence needed |
 | :--- | :--- | :--- |
-| **Type layout mismatch across the Rust ↔ CUDA C++ boundary** | Struct field mismatches invisible to the Rust compiler | `lumen-kabi` as the sole boundary, `lumen_kabi.h` generated by `cbindgen`, per-kernel launch tests under `compute-sanitizer` in CI. |
-| **GPU LTQ decode overhead at batch = 1** | GEMV kernel bottlenecks on bit decoding rather than VRAM bandwidth | Use `int8` activations with `__dp4a`, byte selection via `__byte_perm` (`prmt`), and unified lookup tables in `shared memory`; benchmark against VRAM ceiling at the start of Phase 4. |
-| **CPU LTQ decode compute load at 2–2.6 bpw** | CPUs without AVX-512 (6-core Skylake / Zen 2) may become compute-bound on the lowest formats | Assemble labels via table `XOR`, use AVX-512 VBMI on Zen 4/5, and optionally restrict the minimum format assigned to CPU experts in DP. |
-| **Fisher bit allocation requires a backward pass** | Without Fisher weights, DP bit allocation quality drops by half | Import Fisher profiles from the Python prototype until native block backward passes are added to `lumen-quantize`. |
-| **Calibration sensitivity overfitting to domain** | Aggressively assigning 2 bits to cold experts degrades multilingual KLD | Use diverse multilingual calibration traces and smooth the DP sensitivity profile. |
-| **CUDA kernel compile time and binary size** | Long builds from FlashInfer / CUTLASS templates and format specializations | Split template instantiations across separate `.cu` files for parallel compilation, cache with `sccache`, and emit SASS only for target architectures. |
-| **Standard FlashInfer template limitations** | Need to support 4-token QSA blocks, $K = V$, quantized KV, and sigmoid output gating | Prototype custom FlashInfer variants at the start of Phase 4; fallback is a custom `flash-decoding` kernel. |
-| **Capturing flag waits inside a CUDA Graph** | Inability to capture flag waits would require splitting the step into per-segment graphs | Consumer-reset flag protocol (`WaitValue32` always waits for constant `1`); verify on target driver at the start of Phase 5. |
-| **NVMe disk read latency spikes** | OS page-cache misses or cold NVMe reads causing token latency spikes | Ahead-of-time `Fetch` using known token IDs, dedicated background I/O pool, and `disk.mlock` when sufficient RAM is available. |
-| **Recurrent state rollback complexity** | `GatedDeltaNet` state matrices cannot be rolled back by simply decrementing sequence length | Store a $k$-step state history window in `StatePool` and record `PrefixCache` snapshots only at chat turn boundaries. |
-| **CPU work dispatch overhead on every layer** | Extra microseconds $\times$ 90 crossings per token | User-space spin pool with static partitioning of `(expert, 16-row band)` pairs; monitor crossing $\eta$ via `--trace`. |
-| **Architectural boundary erosion as the codebase grows** | Model-specific branches leaking into the scheduler and backends | Automated CI checks from Phase 1 ([Section 9 of architecture.md](architecture.md#9-extensibility-rules-and-architectural-boundaries)). |
+| 1. Foundation | Types, model component descriptions, placement and `inspect` | Config/selector tests, truthful reporting, and existing dependency-boundary checks |
+| 2. Format interoperability | Container reader, LTQ decoder, external fixtures | Bit-for-bit agreement with Python exports and rejection of malformed input; a native quantizer is not required |
+| 3. First CPU execution | Minimal prepared schedule, reference/CPU execution, one tiny dense model and then a recurrent hybrid, `lumen run` | Logits against an independent implementation; prefill/decode agreement; declared and observed memory bounds |
+| 4. First GPU execution | ABI/build wiring and the kernels needed by those fixtures | CPU/GPU numerical comparison, launch/memory checks, and a small CPU/GPU transfer experiment |
+| 5. Hybrid execution | One model with CPU experts and GPU computation, explicit transfers, basic `probe`/`bench` | Placement-invariant results within tolerances; measured crossing latency, overlap and peak memory; correct completion on error/cancel |
+| 6. Disk tables | Bounded staging and row fetch | Correct rows, cold/hot I/O latency, bounded buffering and error handling; measure available overlap |
+| 7. Measured optimization | Chunked prefill, streaming, repacking/`pack`, selected fusion or graph capture | Differential checks and a reproducible benefit for each adopted optimization |
+| 8. Broader model composition | Additional attention, selection, residual and state mechanisms | Reference parity and resource accounting, including shared and derived representations; no family branches in shared mechanisms |
+| 9. Serving and speculation | Batching, prefix reuse, drafts, chat and HTTP adapters | Sequence isolation, partial acceptance/rollback, cancellation and capacity limits |
+| 10. Media | Preprocessing and encoder/decoder integration | Reference outputs and bounded state for mixed media/text inputs |
+
+Before phase 3 fixes the execution interfaces, exercise a resource description with shared storage, explicitly derived attention inputs, and recurrent state. Count owners once and include scratch. Define step capacities and state ownership early; implementing full serving can wait until phase 9.
+
+## Independent quantizer track
+
+Use ready-made research LTQ exports and tiny dense fixtures to develop inference. Develop native calibration, LDLQ/Viterbi, and bit allocation separately, checking decoder compatibility and quantization quality against the research pipeline. Share model loading and lower-level execution, without making generation scheduling a calibration prerequisite. Import Fisher profiles until native backward implementations have their own checks. See [ltq-design.md](ltq-design.md).
+
+## Decisions that need evidence
+
+- Validate CPU/GPU synchronization and graph capture on the target driver before choosing the flag protocol.
+- Measure decoding cost and shared memory/bus contention before assuming bandwidth-bound execution.
+- Test cold NVMe latency against the actual first consumer; small logical reads do not imply hidden I/O.
+- Budget recurrent history, prefix snapshots and temporary buffers before enabling speculation or more concurrent sequences.
+- Treat [performance.md](performance.md) numbers as projections and targets, not completed milestones or required properties of the architecture.
+
+Keep the existing dependency checks while the crate layout is unchanged. Split or combine crates when actual dependencies and ownership justify it, updating checks together with the code. [Architectural boundaries](architecture.md#9-extensibility-rules-and-architectural-boundaries) remain the guide.

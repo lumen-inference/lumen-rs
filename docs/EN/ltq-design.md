@@ -1,5 +1,7 @@
 # LTQ Design Rationale, Quality Comparisons, and Quantizer
 
+**Implementation status:** this document records the LTQ design and research workflow. The native `lumen-quantize` crate is still a placeholder. Its development is a separate track from first inference; see [roadmap.md](roadmap.md).
+
 This document presents experimental comparisons of the **LTQ** format against existing low-bit quantization formats (`EXL3` and `GGUF IQ*_K`), analyzes the sources of its accuracy gains, and describes the `lumen-quantize` quantization pipeline.
 
 For the bit-level format specification, see [ltq-format.md](ltq-format.md).

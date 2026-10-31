@@ -1,5 +1,7 @@
 # Performance: Hardware Physical Ceiling Model
 
+**Status: performance model proposal.** `Program::floor`, `probe`, and `bench` are not implemented. The reference-rig numbers below are analytical projections, not measured engine throughput. Overlap, cold physical I/O, compute cost, and resource contention must be validated before treating a projection as a usable bound; see [execution-design.md](execution-design.md).
+
 The target platform for `lumen-rs` is a workstation or desktop PC with a single 16–32 GB consumer GPU, a desktop CPU with dual-channel DDR5, and an NVMe SSD. The target workload is a large MoE or hybrid model (tens to hundreds of billions of parameters) in which:
 - attention (`Attention`), linear recurrent layers (`Gated DeltaNet`), shared experts, and a subset of layers reside in **VRAM** and execute on the **GPU**;
 - the bulk of routed MoE experts resides in system **RAM** and executes on the **CPU**;
@@ -61,7 +63,7 @@ A segment cannot finish faster than its most heavily loaded resource: $t_{\text{
 | **VRAM (GDN state)** | Read and write $36 \times 3\text{ MB}$ `fp32` state matrices | **0.23 GB** | **0.25 ms** |
 | **VRAM (KV at 262k)** | QSA indexer (averaged keys of 65,536 blocks $\times$ 12 layers) + attention ($\le 2048$ positions $\times$ 12 layers) | **~0.25 GB** | **~0.3 ms** |
 | **PCIe (GPU ↔ CPU)** | Input and output of 45 CPU segments at ~5 KB each | **0.45 MB** | 90 crossings $\times$ measured latency |
-| **NVMe Disk** | 16 n-gram rows at 86 bytes each (`TCQ4X` rings), page-cache misses | **$\le 1.4$ KB** | Hidden behind early layers |
+| **NVMe Disk** | 16 n-gram rows at 86 bytes each (`TCQ4X` rings), page-cache misses | **$\le 1.4$ KB logical payload** | Overlap assumed; physical read volume and cold latency need measurement |
 
 - **Critical-Path Ceiling:** $5.6\text{ ms (GPU)} + 11.6\text{ ms (CPU)} - 0.25\text{ ms (shared-expert overlap)} \approx \mathbf{17\text{ ms}}$ plus 90 crossings — **approximately 58 tokens/s** at 262k context.
 - **Resource Ceiling:** $11.6\text{ ms}$ (DRAM-bound) — approximately 86 tokens/s (unreachable by a single sequence).

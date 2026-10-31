@@ -1,5 +1,7 @@
 # GPU and CPU Compute Kernels (lumen-cuda-kernels and lumen-cpu)
 
+**Status: kernel design and research results.** CPU/CUDA backend crates are placeholders; the reference crate contains only several pure kernels and an executor skeleton. Algorithms, libraries, capture strategies, and numerical performance below are proposals or results from the linked research prototype, not completed runtime paths in this repository. See [execution-design.md](execution-design.md) for adoption criteria.
+
 This document describes the architecture of the `lumen-rs` compute kernels on GPU (CUDA C++) and CPU (AVX2 / AVX-512), including the algorithms used for fast parallel decoding of the trellis-coded LTQ format.
 
 ---
@@ -25,7 +27,7 @@ On the GPU, custom CUDA C++ kernels decode LTQ tiles and execute model operators
 | **MoE (`mgemm`)** | Custom CUDA C++ | Single thread-block grid across all active experts via the `ExpertBank` descriptor table; tokens grouped by expert; supports distinct LTQ formats per expert. |
 | **Hadamard-256 + `suh`** | Custom CUDA C++ | 8 elements per lane $\times$ 32 warp lanes; all butterfly stages run in registers via `__shfl_xor_sync` fused with `suh` scaling. |
 | **Row Decode (`RowTable`)** | Custom CUDA C++ | Gathers table rows (from VRAM or over PCIe via `ZeroCopy`), decodes `LtqRing` rings (or `int8`) with ring scales, applies block Hadamard $H_B$ and signs. |
-| **Attention (`Attention`)** | **FlashInfer** + custom variants | Paged attention over `KvPool`. Parameters: sliding window, attention sinks, mask, KV layout ($K$ and $V$, $V$-only with on-the-fly $K$ reconstruction, shared KV) and bit width, sigmoid output gate from `q_proj`, sparse page lists from the QSA indexer, `softcap`; uses `split-K` on decode. |
+| **Attention (`Attention`)** | **FlashInfer** + custom variants | Paged attention over `KvPool`. Parameters: sliding window, attention sinks, mask, explicit storage bindings and transformations for logical $K$/$V$ inputs, shared resources and bit width, sigmoid output gate from `q_proj`, sparse page lists from the QSA indexer, `softcap`; uses `split-K` on decode. |
 | **QSA Indexer (`IndexerScore`)** | Custom CUDA C++ | Computes per-head block scores $\text{ReLU}(q \cdot k)$, selects `top-k` blocks, and averages keys of completed 4-token blocks. |
 | **Gated DeltaNet (GDN)** | Custom CUDA C++ | Chunked algorithm during prefill (modeled on `flash-linear-attention`), recurrent state update on decode (with $L_2$-normalized $Q$ and $K$), causal `short conv1d`, and gated output `RMSNormGated`. |
 | **Hyper-Connections (`HcMix`, `HcInject`)** | Custom CUDA C++ | Mixes 4 residual streams before a sub-block, injects outputs back into the streams, and reduces streams before the final norm. |
