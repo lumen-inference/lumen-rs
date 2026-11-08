@@ -1,8 +1,15 @@
-# Supported Model Architectures and Modules (`lumen-models`)
+# Model architecture reference
 
-In `lumen-rs`, each model family in the `lumen-models` crate is assembled from shared **architectural modules (Modules)** ([Section 1 of architecture.md](../architecture.md#1-four-levels-of-modularity)). Model-specific variations are passed as module and operator parameters without modifying the scheduler or compute backends.
+[Русский](../../RU/models/README.md)
+
+Start with the [common block overview](../blocks.md) to see how these mechanisms compose a model. This reference covers differences between families and the parameters needed to implement them. Common terms are defined in the [glossary](../glossary.md).
+
+These are family references and implementation requirements, not a list of working models. The new C17 engine composes models from common blocks; CPU and Vulkan are its first planned compute backends. [blocks.md](../blocks.md) and [architecture.md](../architecture.md) define composition and ownership; [backends.md](../backends.md) defines the device boundary. Module names below describe their meaning, not public C types.
+
+A family describes layer order and shared-block parameters. QSA is not a universal sparse-attention algorithm; another algorithm needs its own composition of operations. State sizes and memory access depend on model parameters and device capabilities.
 
 Detailed specifications for families with specialized modules:
+
 - **[qwen3_next.md](qwen3_next.md)** — hybrid `qwen3_next`, `qwen3_5_dense` (`qwen3_5`), and `qwen3_5_moe` family (3:1 interleaving of `Gated DeltaNet` linear attention and gated full attention).
 - **[qwen4_exp.md](qwen4_exp.md)** — `qwen4_exp` architecture (`Qwen3.8-Flash-Next`: `QSA` sparse attention, 4-stream `Hyper-Connections`, and n-gram `PLE` table).
 - **[gemma4.md](gemma4.md)** — `Gemma 4` family ($K = V$ reconstruction, proportional `p-RoPE`, shared KV cache on final layers, `PLE`, and parallel Dense MLP + MoE).
@@ -15,13 +22,15 @@ Layers of transformer and hybrid models are composed from the following standard
 
 | Category | Module | Role | Used By |
 | :--- | :--- | :--- | :--- |
-| **Sequence Mixers** | **`FullAttention` / `SlidingAttention`** | Causal attention over the full context or a sliding window of the last $W$ tokens, backed by the paged `KvPool`. | All model families |
-| | **`SparseAttention` (QSA)** | Sparse attention with block indexer: a lightweight indexer scores 4-token blocks and selects $\le 512$ relevant blocks, allowing the main KV cache to reside in system RAM (`ZeroCopy`). | `Qwen3.8-Flash-Next` (`qwen4_exp`) |
-| | **`GatedDeltaNet` (GDN)** | Linear recurrent attention maintaining a fixed-size state matrix (~3 MB per layer) updated in $O(1)$ per token instead of a growing KV cache. | `qwen3_next`, `qwen3_5_dense`, `qwen3_5_moe`, `Qwen3.8-Flash-Next` |
+| **Sequence Mixers** | **`FullAttention` / `SlidingAttention`** | Causal attention over the full context or a sliding window of the last $W$ tokens. State resources and representations, including paging, are explicit. | All model families |
+| | **`SparseAttention` (QSA)** | Sparse attention with block indexer: a lightweight indexer scores 4-token blocks and selects $\le 512$ relevant blocks. Keeping the main cache in RAM requires a supported gather and transfer path. | `Qwen3.8-Flash-Next` (`qwen4_exp`) |
+| | **`GatedDeltaNet` (GDN)** | Linear recurrent attention maintaining a state matrix of fixed size for a given configuration (for example, ~3 MiB per layer), updated in $O(1)$ with respect to context length per token instead of a growing KV cache. | `qwen3_next`, `qwen3_5_dense`, `qwen3_5_moe`, `Qwen3.8-Flash-Next` |
 | **Channel Mixers (FFN)** | **`DenseMlp`** | Dense feed-forward block (`SwiGLU` or `GeGLU`). | `Llama`, `Qwen3`, `qwen3_5_dense`, `Gemma 4` |
-| | **`MoE` (Mixture of Experts)** | Mixture of Experts: a router selects `top-k` experts from `ExpertBank`, plus an optional always-active `Shared Expert`. Primary module for CPU offloading. | `Qwen3-MoE`, `qwen3_next`, `qwen3_5_moe`, `Qwen3.8-Flash-Next`, `Gemma 4 26B-A4B`, `gpt-oss` |
-| **Adapters & Residuals** | **`PLE` (Per-Layer Embeddings)** | Per-layer embedding or n-gram lookup table (`RowTable`) indexed by token IDs, suitable for NVMe disk offload (`Fetch`). | `Gemma 4 E2B/E4B`, `Qwen3.8-Flash-Next` |
+| | **`MoE` (Mixture of Experts)** | Mixture of Experts: a router selects `top-k` experts from a weight bank, plus an optional always-active `Shared Expert`. CPU execution is one placement option considered during preparation. | `Qwen3-MoE`, `qwen3_next`, `qwen3_5_moe`, `Qwen3.8-Flash-Next`, `Gemma 4 26B-A4B`, `gpt-oss` |
+| **Adapters & Residuals** | **`PLE` (Per-Layer Embeddings)** | Per-layer embedding or n-gram lookup table indexed by token IDs. NVMe storage requires explicit row fetching, decoding, and delivery to the consumer. | `Gemma 4 E2B/E4B`, `Qwen3.8-Flash-Next` |
 | | **`HyperConnections`** | Multi-stream residual connection (4 parallel `residual` streams mixed before each sub-block). | `Qwen3.8-Flash-Next` |
+
+Preparation checks operations, shapes, types, layouts, and state changes through the backend registry. K and V are input roles: shared storage or K derived from V must appear in the graph, without automatically allocating a pair of caches. Transfers and representation conversions belong in the plan. An unsupported path is rejected before execution or placed on another allowed device during preparation; there is no silent CPU fallback. Adding a backend for these operations does not require changing family descriptions.
 
 ---
 

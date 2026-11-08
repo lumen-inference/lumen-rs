@@ -1,60 +1,85 @@
-# External Interfaces: Chat Layer, CLI, and HTTP Server
+# Velri external interfaces
 
-**Status: interface proposal.** Only `inspect` is operational, reporting resolved placement, access classifications, and rule provenance. Runtime memory reports, hardware ceilings, generation, chat, serving, probing, packing, and quantization are not implemented. The command and protocol descriptions below are planned behavior, not a ready public API.
+[Русский](../RU/api.md)
 
-The external interface layer on top of [`Engine`](architecture.md#8-generation-runtime-engine-speculative-decoding-and-multimodality) is divided into three crates:
-- **`lumen-chat`** — formats conversational messages (text, images, audio, system prompts, and tool definitions) into tokens and parses generated token streams into typed events.
-- **`lumen-cli`** — the `lumen` binary for running generation, inspecting placement plans, benchmarking hardware, and quantizing models.
-- **`lumen-server`** — an `axum` HTTP server compatible with the **OpenAI API** and **Anthropic Messages API** protocols.
+Terms used in this document are explained in the [glossary](glossary.md).
 
----
+**Status: proposed C API and applications.** Public C headers do not exist yet. The current Rust CLI implements `inspect`; generation, serving and quantization commands are not ready. This document describes how the future interfaces should work. Mentioning a function here does not mean it can already be called.
 
-## 1. Chat Layer and Output Parsing (`lumen-chat`)
+## How an application uses the library
 
-All metadata required for prompt formatting is stored directly inside the `.ltq` file header ([see container specification](ltq-format.md#6-row-slices-and-the-ltq-container)): the tokenizer vocabulary (`tokenizer`), chat template (`chat_template`), and media preprocessor configuration (`processor_config`).
+An application will be able to use the compute engine directly, without a CLI, HTTP server, chat template or tokenizer. The minimal path accepts token IDs, executes a computation step and returns logits or selected tokens, depending on the mode.
 
-1. **Tokenization and template rendering:**
-   Tokenization is handled by the `tokenizers` crate. The chat template is rendered via `minijinja` with `minijinja-contrib` (`pycompat` for Python string methods used in HuggingFace templates), plus `raise_exception` and `strftime_now`.
-2. **Template arguments (`kwargs`):**
-   Default values are read from the config's `chat-template.kwargs` section and merged with per-request parameters (`reasoning_effort` in OpenAI API or `thinking` in Anthropic API).
-3. **Multimodal messages:**
-   Images, video, and audio are preprocessed by `lumen-media`; the template inserts the corresponding number of placeholder tokens into the token stream.
-4. **Incremental detokenization and special block parsing:**
-   - The detokenizer tracks prefix and read offsets, holding incomplete multi-byte UTF-8 sequences until the next token arrives.
-   - Reasoning blocks and tool calls are parsed by **special token IDs** rather than text matching: `gpt-oss` models use `openai-harmony` (channels `analysis`, `commentary`, `final`, and `to=functions.*` calls), while Qwen models use the `<think>` and `<tool_call>` special tokens.
+Long-lived objects use opaque types. Applications create and access them through the API; the library controls their internal representation. Each object has its own role and lifetime requirements:
 
-`lumen-chat` emits a unified stream of `ChatEvent` items:
-- `ReasoningDelta(String)`
-- `TextDelta(String)`
-- `ToolCallStart`, `ToolArgsDelta`, `ToolCallEnd`
-- `Done { reason, usage }`
+| Object | Responsibility and lifetime |
+| :--- | :--- |
+| Context | Holds devices, the worker pool and platform resources. Must outlive all dependent objects. |
+| Model | Holds configuration, weights and prepared representations. Several sessions may share one model. |
+| Program | Holds a checked execution plan for a particular model, context and set of limits. |
+| Session | Holds mutable sequence state and reserved workspace. |
 
----
+Every creation operation has a matching release operation. Attempting to destroy an object with live dependents must return a useful error. For example, a context cannot be freed while a session still needs it, leaving the session with pointers to released memory.
 
-## 2. Command-Line Interface (`lumen-cli`)
+Exact function names and public descriptor sizes will be fixed with the first working implementation. Internal library structures do not carry a stable ABI promise.
+
+Applications enumerate and select devices through the common context API. Backend registrations and function tables belong to the internal [backend interface](backends.md). Adding a module to the build does not change the model-step API. Public headers expose neither dependency types, Vulkan types nor other device API types; compatibility with external binary plugins is not promised yet.
+
+## Buffers and concurrent calls
+
+The API specifies ownership for every buffer passed across it. This tells the application when it may modify or release memory.
+
+The first `step` will be synchronous. Borrowed input remains valid until the call returns with a ready result. Borrowed session output remains valid until the next operation that changes it or until the session is destroyed. An application makes a copy to retain the output longer.
+
+Backends may execute asynchronously inside the synchronous call, using completion objects. Before returning to the application, `step` must wait for accepted work and any required output transfers.
+
+A future asynchronous API would need its own completion object and buffer-retention rules. The synchronous `step` rules cannot simply be applied to it.
+
+Only one step may run in a session at a time. Different sessions have independent state, but their shared context scheduler must coordinate concurrent execution. Headers will identify which functions may be called concurrently. Creating several sessions does not itself promise higher throughput from running them together.
+
+## What happens on an error
+
+Functions return execution statuses. Causes include invalid arguments, unsupported operations, memory or capacity exhaustion, I/O errors and device errors. Diagnostics preserve the cause and context so the application can explain the failure. The library does not terminate the process or use `longjmp` through caller code.
+
+Sizes and offsets are checked before access, including multiplication overflow. Invalid input arguments must be detected before a step starts.
+
+A failure during an already-started step needs different handling. If state has changed, the session becomes unusable until an explicit `reset`. Automatic `rollback` is not promised until implemented. Partial output cannot be reported as a successful result: its producers must complete and the numerical requirements must be checked first.
+
+## How cancellation works
+
+A separate cancellation request may be available during a step. Requesting cancellation does not mean all computation has stopped. Memory cannot be freed while an outstanding CPU or GPU job still accesses it.
+
+Completion or reset must wait for every user of the relevant resources. Applications must distinguish three outcomes: normal `stop`, requested cancellation and failure.
+
+Cancellation accepted before the backend accepts the step's first job leaves the previous session state intact. Once work is accepted, the initial API requires `reset` after cancellation completes. Continuing from the last confirmed token without resetting is not promised; that would need separate state-rollback rules. The runtime commits one terminal outcome, so cancellation after successful completion does not revoke a ready result.
+
+Device loss invokes the backend's shutdown procedure. Affected resources cannot be reused until safe release is established.
+
+## Text and chat above computation
+
+Tokenizers and chat templates will be adapters above the compute core. Verify compatibility using exact token IDs, special tokens, Unicode handling, byte fallback and streaming decoding. Check conversation formatting separately from tokenization: correct token splitting does not prove that messages are formatted as the model expects.
+
+An unsupported chat template must not silently be replaced with an approximation. Such a replacement requires an explicit user choice.
+
+Model metadata determines message handling and output special-token processing. Applications receive text, reasoning and tool-call events. Concrete HTTP protocols remain outside mathematical blocks. Candidate libraries and unresolved choices are listed in [dependencies.md](dependencies.md).
+
+## CLI and HTTP server
+
+The command-line applications are planned to provide:
 
 | Command | Purpose |
 | :--- | :--- |
-| **`lumen run`** | Single-prompt generation (`lumen run -c cfg.json -p "…"`). Runs the `Engine::step()` loop synchronously on the main thread, flushing `stdout` after each token. |
-| **`lumen chat`** | Interactive multi-turn terminal chat preserving the KV prefix cache across turns. |
-| **`lumen serve`** | Starts the HTTP server using parameters from the config's `server` section. |
-| **`lumen inspect`** | Prints the resolved per-layer `PlacementPlan` with the JSON rule source for every value, memory usage by device and class (weights, KV per token, state per sequence), per-token resource byte counts, and both hardware step ceilings ([performance.md](performance.md)). `--model-config <config.json>` takes the architecture from a HuggingFace `config.json` instead of the `.ltq` file, so a placement can be inspected before the model is quantized. |
-| **`lumen probe`** | Measures hardware bandwidths and latencies and saves the profile to `hw-profile.json`. |
-| **`lumen bench`** | Measures prompt processing (`pp`) and token generation (`tg`) throughput in tokens/s along with hardware efficiency $\eta$ per step, resource, and segment; `--trace` writes a Chrome Trace timeline. |
-| **`lumen pack`** | Repacks `.ltq` model weights into target backend layouts (`CpuBand16` / `GpuWarp`) on disk ([Section 6 of architecture.md](architecture.md#6-weight-representations-and-model-loading)). |
-| **`lumen quantize`** | Quantizes a BF16 (`safetensors`) checkpoint into a `.ltq` container. |
+| `inspect` | Show requested and resolved placement, registered backends, actual devices, applied settings, capabilities and available memory calculations. |
+| `run`, `chat` | Run generation or interactive chat through the library. |
+| `probe`, `bench` | Measure hardware, kernels and complete steps; retain parameters and timelines. |
+| `pack` | Perform verified weight repacking with an explicit destination-layout version. |
+| `quantize` | Run a separate calibration and LTQ export tool. |
+| `serve` | Run an optional HTTP/SSE application. |
 
-Speculative decoding flags: `--draft cfg.json`, `--spec-k 4`, `--ngram`, `--mtp`.
+Distinguish the working Rust `inspect` from the planned C applications. This table describes the target commands and their responsibilities.
 
----
+The HTTP layer translates requests into runtime commands and runtime events into client responses. Compatibility with selected external API versions is planned. Adapter tests must define the supported fields: “compatible” does not mean every feature of the external service is implemented.
 
-## 3. HTTP Server (`lumen-server`)
+Request and output-event queues must be bounded. When a client reads slowly, the server applies backpressure or cancels with an explanation. It must not accumulate ready tokens without a memory limit.
 
-The `server` configuration section defines `host`, `port`, and `max-concurrent-requests` (the maximum number of sequences processed concurrently by `Engine`; additional requests wait in a queue).
-
-The `Engine` thread receives `Command::{Submit, Cancel, Shutdown}` messages over a `std::sync::mpsc` channel and sends generated events to a per-request `tokio::sync::mpsc::UnboundedSender`. The `axum` handler wraps the receiver into a Server-Sent Events (SSE) stream. If a client disconnects, the receiver is dropped, `send` returns an error, and `Engine` cancels the sequence and frees its KV and state allocations.
-
-| API | Endpoints | SSE Stream Format | Implementation Details |
-| :--- | :--- | :--- | :--- |
-| **OpenAI** | `POST /v1/chat/completions`<br/>`GET /v1/models` | `chat.completion.chunk` chunks, terminated by `data: [DONE]`; `usage` included when `stream_options.include_usage` is set | Reasoning mapped to `reasoning_content`; tool calls streamed in `tool_calls` with index and streaming `arguments`; `developer` role mapped to `system`; images passed via `image_url` (data URL), audio via `input_audio`. |
-| **Anthropic** | `POST /v1/messages`<br/>`POST /v1/messages/count_tokens` | `message_start` → `content_block_start/delta/stop` → `message_delta` → `message_stop`, plus `ping` | `system` passed as a top-level field, `max_tokens` required; reasoning emitted as `thinking_delta`, tool arguments as `input_json_delta`; stop reasons: `end_turn`, `max_tokens`, `stop_sequence`, `tool_use`; `budget_tokens` closes reasoning via a sampler hook; images passed as `base64` `image` blocks. |
+A disconnected client requests cancellation. The runtime then waits for outstanding work and releases state. The server library does not control GPU-buffer lifetimes. CivetWeb remains a candidate until this behavior is verified.

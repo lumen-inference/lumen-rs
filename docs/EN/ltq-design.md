@@ -1,8 +1,14 @@
 # LTQ Design Rationale, Quality Comparisons, and Quantizer
 
-**Implementation status:** this document records the LTQ design and research workflow. The native `lumen-quantize` crate is still a placeholder. Its development is a separate track from first inference; see [roadmap.md](roadmap.md).
+[Русский](../RU/ltq-design.md)
 
-This document presents experimental comparisons of the **LTQ** format against existing low-bit quantization formats (`EXL3` and `GGUF IQ*_K`), analyzes the sources of its accuracy gains, and describes the `lumen-quantize` quantization pipeline.
+This document explains why LTQ is used and what quantization experiments showed. The tables apply to the stated models and research conditions. See the [glossary](glossary.md) for definitions and the separate [specification](ltq-format.md) for reading file bytes.
+
+> The migration to C17 with CPU and Vulkan backends preserves the LTQ v1 byte specification. The research GPU results below are not measurements of the new Vulkan backend.
+
+**Implementation status:** this document records the LTQ design and research workflow. The new engine's native quantizer is not implemented; the earlier Rust `lumen-quantize` crate remains a placeholder and does not define its future API. Quantizer development is a separate track from first inference; see [roadmap.md](roadmap.md).
+
+This document presents experimental comparisons of the **LTQ** format against existing low-bit quantization formats (`EXL3` and `GGUF IQ*_K`), analyzes the sources of its accuracy gains, and describes the planned `velri-quantize` quantization pipeline.
 
 For the bit-level format specification, see [ltq-format.md](ltq-format.md).
 
@@ -23,7 +29,7 @@ In experimental benchmarks ([`ltq-research/`](https://github.com/lumen-inference
 | **Qwen3.5-4B** | Hybrid Gated DeltaNet + Attention | Per-matrix EXL3 quantizer on identical Hessians (3.0 / 3.5 / 4.0) | **−14…−18% / −18…−21%** |
 | **Gemma 4 E4B** | PLE, Shared KV, Sliding Attention | Per-matrix EXL3 quantizer on identical Hessians | **−15…−26% / −17…−22%** |
 
-LTQ quantization on a single GPU runs **2.4–7× faster** than EXL3 conversion: quantizing `Qwen3-8B` takes 4–5 minutes, and `Qwen3-30B-A3B` takes 11–13 minutes on an RTX PRO 6000.
+In the research implementation, LTQ quantization on a single GPU runs **2.4–7× faster** than EXL3 conversion: quantizing `Qwen3-8B` takes 4–5 minutes, and `Qwen3-30B-A3B` takes 11–13 minutes on an RTX PRO 6000.
 
 ### Comparison Against Published Quants on `Qwen3.8-27B`
 
@@ -49,15 +55,17 @@ LTQ was compared against published quantizations of `Qwen3.8-27B` at matched siz
 3. **Fisher-Weighted Row-Slice Bit Allocation (DP Knapsack).**
    In MoE models such as `Qwen3-30B-A3B`, attention layers account for only 3% of parameters but dominate output sensitivity. Weighting quantization error by Fisher information allows the DP solver to allocate ~4.4 bits to attention slices at the cost of only 0.05 bits on routed experts — cutting KLD at a 3.0 bpw budget by 52%.
 4. **Sensitivity Profile Smoothing.**
-   Empirical expert sensitivity measured on a narrow calibration set can overfit to specific topics or languages (for instance, aggressively dropping cold experts to 2 bits degrades multilingual KLD on 30B by 55%). Consequently, `lumen-quantize` smooths the DP sensitivity profile and uses diverse multilingual calibration traces.
+   Empirical expert sensitivity measured on a narrow calibration set can overfit to specific topics or languages (for instance, aggressively dropping cold experts to 2 bits degrades multilingual KLD on 30B by 55%). Consequently, the native quantizer requires sensitivity profile smoothing and diverse multilingual calibration traces.
 5. **Hadamard-Rotated LTQ Rings for Row Lookup Tables (`LtqRing`).**
    On the `Gemma 4 E4B` PLE table (5.25 GiB in `bf16`), `TCQ4X` rings with block Hadamard rotation compress the table to 1.39 GiB at `0.0010` KLD (compared to 2.65 GiB and `0.0006` KLD for `int8`). Omitting the Hadamard rotation increases KLD by 2.4× due to coordinate outliers.
 
 ---
 
-## 3. The Quantizer Pipeline (`lumen-quantize`)
+## 3. Planned Native Quantizer Pipeline
 
-The quantizer processes models layer-by-layer with a single layer resident in memory at a time:
+The pipeline brings the research algorithm into the C17 engine. Forward passes use [common model blocks](blocks.md), while quantization operations are checked through the [backend registry](backends.md). CPU or Vulkan inference support alone does not imply support for Hessians, backward passes, or Viterbi search. An unsupported stage needs a supported path selected in advance or an explicit preparation error.
+
+Processing proceeds layer by layer, with one current layer's weights in working memory. Activations, Hessians, profiles, and temporary representations require separate memory budgeting. The algorithm proceeds as follows:
 
 1. **Calibration Pass and Hessian Collection:**
    The engine runs a forward pass over the calibration dataset, accumulating input Hessians $H = X X^T$ for each group of linear layers sharing an input. Calibration activations flow through already-quantized layers so subsequent layers compensate for accumulated quantization error.
@@ -65,12 +73,14 @@ The quantizer processes models layer-by-layer with a single layer resident in me
    Measures loss sensitivity to perturbations in each matrix row over sampled model continuations. Until backward passes for all supported modules are implemented natively in the engine, Fisher profiles can be imported from the reference Python scripts (`fisher_full.py` / `fisher_offload.py`).
 3. **Slice Profiling and DP Format Assignment:**
    Each row slice is evaluated with a fast proxy quantizer, and its Fisher-weighted error is scaled by the calibrated distortion curve of each of the 19 menu formats. Dynamic programming solves the knapsack problem to assign optimal formats under the target bit budget.
-4. **GPU Matrix Quantization:**
+4. **Matrix Quantization (GPU in the Research Implementation):**
    - Computes input signs and scales `suh` (via Cauchy–Schwarz), applies Hadamard-256 to the weights and Hessian, and damps the Hessian diagonal ($0.2\times$ mean diagonal).
    - Runs **Block16-LDLQ** across 16-column blocks, propagating quantization error into remaining unquantized columns.
-   - Executes two-pass tail-biting **Viterbi** search on GPU across $16 \times 16$ tiles, followed by linear scale polishing of `d_row` and `suh`.
-5. **`.ltq` Container Serialization:**
-   Writes the compressed tensors to the `.ltq` file and reconstructs the quantized weights to advance calibration activations to the next layer.
+   - Executes tail-biting **Viterbi** search across $16 \times 16$ tiles, followed by linear scale polishing of `d_row` and `suh`. The search contract is specified in [LTQ v1, Section 8](ltq-format.md#8-quantizer-contract). The research implementation uses a GPU kernel for the search; the new engine must separately establish support on the selected backend.
+5. **`.vtq` Container Serialization:**
+   Writes the compressed tensors to the `.vtq` file and reconstructs the quantized weights to advance calibration activations to the next layer.
+
+The file format is separate from a device's internal weight representation. Preparation explicitly includes the loading, packing, unpacking, and transfers required by the selected implementation; copying bytes does not convert layouts. Adding a backend does not change LTQ v1: the backend declares support for the required operations and representations through the common contract. Research CUDA code can remain a reference without becoming a mandatory engine dependency or a claim of an available Vulkan path.
 
 ---
 

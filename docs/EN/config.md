@@ -1,163 +1,98 @@
-# Configuration and Cascading Placement (lumen-config)
+# C/Vulkan engine configuration
 
-**Status:** parsing, placement resolution, and `inspect` exist. Acceptance of a runtime/backend setting does not mean that its execution path is implemented or supported; see [architecture.md](architecture.md).
+[Русский](../RU/config.md)
 
-A configuration file in `lumen-rs` is a JSON document that defines:
-1. **The model and the placement of its components across hardware devices** (`model` section).
-2. **Runtime and backend parameters**: context length, KV cache quantization, CPU and disk thread pools, CUDA prefill chunking, and HTTP server settings.
+Terms used in this document are explained in the [glossary](glossary.md).
 
-At load time, the configuration is validated and resolved once into a flat `PlacementPlan` ([Section 3 of architecture.md](architecture.md#3-placement-plan-placementplan-and-data-access-modes)). Nothing reads the JSON file during generation.
+**Status: proposed new schema.** The working Rust parser and existing JSON examples are described in [rust-config.md](rust-config.md). The current CLI does not accept the example on this page yet. Moving configuration to the new schema is a separate task.
 
-Example configurations are located in [`examples/`](../../examples/):
-- [`examples/example-dense.json`](../../examples/example-dense.json) — 27B hybrid dense model (`Qwen3.8-27B`).
-- [`examples/example-moe.json`](../../examples/example-moe.json) — hybrid MoE model with n-gram table and sparse attention (`Qwen3.8-Flash-Next`).
+The new schema retains JSON and three separate fields: `store`, `compute` and `prefill-compute`. Configuration is read once. After validation, the engine receives a placement plan for data and computations that it can use during model execution.
 
----
+Compute devices are resolved through the [backend registry](backends.md). The parser reads `<backend>:<index>` and checks the name against that registry. Adding a module does not add its name to a separate `switch` in the parser or planner. Each module's settings live under `backends.<name>` and are checked by its handler when creating the context.
 
-## 1. Cascading Placement Principle
+Recognizing a key does not mean a backend can execute the requested operation. Parsing JSON and checking device capabilities are therefore separate preparation tasks.
 
-A model contains dozens of layers, each with roughly ten internal sub-components (attention projections, cache, router, shared and routed experts, normalizations). To avoid listing device assignments for every tensor manually, the configuration uses **cascading inheritance**:
+## Where to store data and run computations
 
-1. At the top level of `"model"`, default placement parameters are defined for the entire model (for example, `"store": "vram:0"` and `"compute": "cuda:0"`).
-2. All child modules and layers inherit these defaults automatically.
-3. For large components that do not fit in VRAM (such as routed experts `moe/routed-experts` or the `ple/table` lookup table), `store` and `compute` are overridden on the corresponding subtree.
-4. To place specific layers on a different device, **layer range selectors** (such as `"32-47"`) are placed inside `"hidden-layers"`.
+`store` selects persistent storage. `compute` selects decode execution. `prefill-compute` may separately select prefill execution; when omitted, it uses `compute`.
 
-### Inherited Placement Properties
+The placement fields provide these values:
 
-Any node in the model tree may specify three inherited keys:
-- **`"store"`** — permanent storage location (`"vram:0"`, `"ram:0"`, `"disk"`).
-- **`"compute"`** — compute device during token generation (`"cuda:0"`, `"cpu:0"`).
-- **`"prefill-compute"`** *(optional)* — compute device during prompt processing (prefill). For example, if a component specifies `"store": "ram:0"`, `"compute": "cpu:0"`, and `"prefill-compute": "cuda:0"`, it runs on the CPU during token decode, while during prefill its weights are streamed over PCIe into a VRAM ring buffer and computed on the GPU.
+| Value | Meaning in the new schema |
+| :--- | :--- |
+| `cpu:0` | CPU execution context. |
+| `vulkan:0` | In `compute`, execution on the selected Vulkan device; in `store`, storage managed by that device. |
+| `ram:0` | Host-memory storage. It does not promise placement on a particular NUMA node. |
+| `disk` | File storage. Loading the required data must be explicitly prepared. |
 
----
+A device index is resolved to an actual device at startup. `inspect` must show its name and identifier so the user can check where work was placed. The schema does not assume an NVIDIA GPU.
 
-## 2. Model Component Tree
+The index belongs to the named backend's devices and does not promise stable ordering across runs. `ram:0` and `disk` identify stores and cannot be selected as compute backends. A device must separately confirm support for its selected storage or execution role. On UMA, memory managed by the GPU backend may occupy shared physical RAM.
 
-Valid configuration paths are defined by the loaded model's `Architecture::components()` method. A typical component tree has the following structure:
+The earlier proposed name `device:0` is no longer used: with several backends, it would be unclear which device it names. The new example explicitly places storage on `vulkan:0`. This changes the proposed C configuration; the existing Rust parser remains documented separately.
 
-```text
-model
-├── input-layer/                  # Input token embedding table (embed)
-├── ple/                          # Per-Layer Embeddings (Gemma 4) or n-gram table (Qwen3.8)
-│   ├── table                     # Row lookup table ("store": "disk" or "ram:0")
-│   └── projections               # Per-layer PLE linear projections
-├── vision-tower/                 # Vision encoder (ViT)
-├── audio-tower/                  # Audio encoder (Conformer)
-├── hidden-layers/                # Repeating decoder layers (0 .. N-1)
-│   ├── norms/                    # Layer normalizations (input-norm, post-attention-norm, etc.)
-│   ├── attention/                # Full, Sliding, or Sparse Attention module
-│   │   ├── q, k, v, o            # Attention projection matrices (q includes output gate)
-│   │   ├── qk-norm, rope         # Q/K normalization and RoPE positional encoding
-│   │   ├── indexer/keys          # Indexer key cache (for QSA sparse attention)
-│   │   └── kv-cache              # Paged KV cache of the layer
-│   ├── linear-attention/         # Linear attention module (Gated DeltaNet / GDN)
-│   │   ├── projections/          # Projections (qkv, z, b, a, qkvz, ba, out)
-│   │   ├── conv, norm            # Short causal conv1d and gated output norm
-│   │   └── state                 # Layer recurrent state (StatePool)
-│   ├── hyper-connections/        # Multi-stream residual module (Hyper-Connections)
-│   ├── dense-mlp/                # Dense FFN block (gate, up, down)
-│   ├── moe/                      # Mixture-of-Experts module
-│   │   ├── router                # Expert router
-│   │   ├── shared-experts/       # Shared experts (gate, projections/...)
-│   │   └── routed-experts/       # Routed expert bank
-│   │       └── projections/      # Expert gate, up, down matrices
-│   └── "<layer-selector>"/       # Layer range override: e.g. "0-15" or "32-47"
-├── output-layer/                 # Final norm (norm) and output vocabulary head (lm-head)
-└── mtp/                          # Multi-Token Prediction module (subtree of the same shape)
-```
+Old `cuda:N` values must not silently become `vulkan:N`. Diagnostics should explain configuration migration, after which the selected device's capabilities must be checked again.
 
----
+Separate storage and execution locations require a supported access or copying strategy and a compatible data representation. For example, settings requesting RAM storage and GPU execution do not implement the transfer between them. Preparation must verify that the path exists. The common RAM route connects backends; changing a layout requires an explicit supported conversion.
 
-## 3. Cascade and Layer-Selector Resolution Rules
+## How settings inherit through the model tree
 
-1. **Inheritance:** only the `compute`, `store`, and `prefill-compute` keys are inherited down the tree.
-2. **Layer selectors:** directly inside `"hidden-layers"`, layer index selectors of the form `"N"` and `"N-M"` (including comma-separated ranges) are permitted. Each selector contains a subtree with the same structure as `"hidden-layers"`.
-3. **Precedence order:** the value for `(layer ℓ, component_path)` is resolved in the following order (from highest to lowest priority):
-   - **Priority 1 (layer selector):** the deepest matching node inside a layer selector matching layer $\ell$. A layer selector overrides the general `hidden-layers` subtree at any depth.
-   - **Priority 2 (general layer tree):** the deepest matching node directly under `hidden-layers`.
-   - **Priority 3 (model root):** default values at the root of `"model"`.
-4. **Validation:**
-   - Two selectors overlapping on the same layer index produce a load error.
-   - Layer indices outside `[0, num_hidden_layers)` produce a warning (or an error with `--strict`).
-   - An unknown key produces an error suggesting the closest valid name (e.g., `"stor"` → `"store"`).
-   - Valid tree components absent from a specific model or layer (e.g., `moe` in dense layers or `shared-experts` in `gpt-oss`) are ignored and noted in `lumen inspect`.
+Configuration retains the model's component tree. This lets users set a general placement at the top and override it for particular components. Only three placement fields inherit downward: `store`, `compute` and `prefill-compute`.
 
-### Resolution Example (`examples/example-moe.json`, 48 layers)
+`backends.<name>` settings do not inherit through the model tree. The module validates them once when creating the context and converts them into internal parameters; kernels do not receive model JSON.
+
+For a component of a particular layer, the deepest applicable node supplies the value. A layer-selector override takes precedence over a rule in the general layer subtree. Overlapping selectors are rejected, so JSON key order cannot affect the result.
+
+The particular model description supplies valid component paths. Not every attention block must have `q`, `k`, `v` and two caches: different models can organize attention differently.
+
+A rule targeting a known component absent from this model is reported as inapplicable. A misspelled key is an error. Out-of-range layer selectors must follow an explicit strictness policy rather than accidental parser behavior.
+
+## Example for a model with experts
+
+The following JSON illustrates the target schema:
 
 ```json
-"model": {
-  "path": "models/qwen3.8-flash-next/model.ltq",
-  "compute": "cuda:0",
-  "store": "vram:0",
-  "hidden-layers": {
-    "moe": {
-      "routed-experts": {
-        "compute": "cpu:0", "store": "ram:0", "prefill-compute": "cuda:0"
-      }
-    },
-    "32-47": {
+{
+  "model": {
+    "path": "model.vtq",
+    "store": "vulkan:0",
+    "compute": "vulkan:0",
+    "hidden-layers": {
       "moe": {
         "routed-experts": {
-          "compute": "cuda:0", "store": "vram:0"
+          "store": "ram:0",
+          "compute": "cpu:0",
+          "prefill-compute": "vulkan:0"
         }
       }
+    }
+  },
+  "backends": {
+    "cpu": {
+      "threads": 0,
+      "reserve-cores": 1,
+      "affinity": "auto"
     }
   }
 }
 ```
 
-| Layer | Component | Resolved `compute` / `store` | Rule Source |
-| :---: | :--- | :---: | :--- |
-| `0..47` | `attention`, `linear-attention`, `moe/router`, `moe/shared-experts` | `cuda:0` / `vram:0` | `"model"` root |
-| `0..31` | `moe/routed-experts` | `cpu:0` / `ram:0` (`prefill`: `cuda:0`) | `hidden-layers → moe → routed-experts` |
-| `32..47` | `moe/routed-experts` | `cuda:0` / `vram:0` | `hidden-layers → "32-47" → moe → routed-experts` |
+At model level, storage and execution are requested on `vulkan:0`. Routed experts override those settings: their data resides in `ram:0`, decode runs on `cpu:0` and prefill on `vulkan:0`. Data access and required copies still need validation. `backends.cpu` configures the CPU module; other backends have their own sections under the same rule.
 
----
+`threads: 0` asks the engine to choose a worker count automatically from OS resources available to the process, accounting for the reserve. A positive value requests that number of workers. Available logical CPUs must not be treated as physical cores.
 
-## 4. Top-Level Sections and Backend Settings
+If required affinity cannot be established, preparation must fail. `affinity: "auto"` permits explained fallback to unbound execution; `"none"` disables binding.
 
-Outside the `"model"` object, top-level sections configure sequence, backend, and server parameters:
+## Limits and plan validation
 
-```json
-{
-  "chat-template": {
-    "kwargs": { "enable_thinking": true }
-  },
-  "context": {
-    "size": 262144
-  },
-  "kv-quantization": {
-    "k-bits": 8,
-    "v-bits": 5
-  },
-  "cuda": {
-    "prefill-chunk-size": 4096,
-    "cuda-graphs": true
-  },
-  "cpu": {
-    "threads": 16,
-    "reserve-cores": 1,
-    "numa-spread": false
-  },
-  "disk": {
-    "io-threads": 4,
-    "mlock": false
-  },
-  "server": {
-    "host": "127.0.0.1",
-    "port": 8080,
-    "max-concurrent-requests": 1
-  },
-  "attention-mechanism": "flash-attention"
-}
-```
+Preparation parameters include context, step-token, sequence and memory limits. Their exact JSON names and defaults will be fixed with the C API. Old experimental settings are not all carried over automatically.
 
-- **`chat-template.kwargs`** — default variables passed to the model's Jinja chat template ([api.md](api.md)).
-- **`context.size`** — maximum sequence context length in tokens, determining KV and state pool allocations.
-- **`kv-quantization`** — bit widths for keys (`k-bits`) and values (`v-bits`) from 2 to 8 bits; if omitted, the KV cache is stored in `bf16`.
-- **`attention-mechanism`** — attention implementation to use (defaults to `"flash-attention"`).
-- **`cuda`** — prompt chunk size `prefill-chunk-size` and `cuda-graphs` toggle (defaults to `true`; disabling is useful during profiling).
-- **`cpu`** — spin-pool worker count `threads` (`0` = all physical cores on the node minus `reserve-cores`, which defaults to 1) and multi-socket `numa-spread` toggle.
-- **`disk`** — disk I/O worker count `io-threads` and `mlock` toggle to pin disk tables in RAM when memory permits.
-- **`server`** — bind host, port, and `max-concurrent-requests` limit for `lumen serve`.
+After resolving placement, preparation checks concrete operations, shapes, dtypes, strides, layouts, memory types and available capacities. An unknown operation or missing GPU capability must produce a useful error. A backend may support only some operations, but a prepared whole-model plan must have implementations for every operation it needs.
+
+Diagnostics distinguish an unknown backend name, a module disabled at build time and the absence of a suitable device. Misspelled module-specific settings are not ignored either. Understanding a settings schema still does not establish support for every operation.
+
+Explicitly pinning an unsupported operation to a device fails preparation. A permitted placement mode may choose another device, including CPU, or a declared equivalent decomposition. The report shows the actual plan, reason, transfers and their costs. An unsupported operation cannot switch to CPU midway through a step. Exact names and defaults for automatic-placement modes remain to be fixed in the new schema.
+
+`inspect` must separately show user requests, resolved placement rules and verified device capabilities. Every value shows its origin: directly set on a component, inherited, or obtained while resolving configuration.
+
+Memory accounting follows storage owners and includes padding, repacking and scratch. If a calculation is not implemented, its field is marked unavailable. A conditional estimate must not appear to be a verified value.

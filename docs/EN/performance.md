@@ -1,89 +1,88 @@
-# Performance: Hardware Physical Ceiling Model
+# How we evaluate performance
 
-**Status: performance model proposal.** `Program::floor`, `probe`, and `bench` are not implemented. The reference-rig numbers below are analytical projections, not measured engine throughput. Overlap, cold physical I/O, compute cost, and resource contention must be validated before treating a projection as a usable bound; see [execution-design.md](execution-design.md).
+[Русский](../RU/performance.md)
 
-The target platform for `lumen-rs` is a workstation or desktop PC with a single 16–32 GB consumer GPU, a desktop CPU with dual-channel DDR5, and an NVMe SSD. The target workload is a large MoE or hybrid model (tens to hundreds of billions of parameters) in which:
-- attention (`Attention`), linear recurrent layers (`Gated DeltaNet`), shared experts, and a subset of layers reside in **VRAM** and execute on the **GPU**;
-- the bulk of routed MoE experts resides in system **RAM** and executes on the **CPU**;
-- large lookup tables (n-grams, PLE) reside on **NVMe disk**.
+This document defines measurement rules for the move to C and Vulkan. Terms are explained in the [glossary](glossary.md).
 
----
+**Status:** the C runtime and Vulkan backend are not implemented. Existing CPU measurements describe the old Rust implementation and are stored in [cpu-performance.md](cpu-performance.md) and the experiment archive (`../benchmarks/`). They do not establish performance of the future implementation. CLI commands `probe` and `bench` are still being designed.
 
-## 1. Evaluating Against Physical Hardware Limits ($\eta$)
+## What we measure
 
-For every compiled `Program` and hardware profile, the scheduler computes the analytical lower bound on step time $t_{\text{floor}}$ dictated by memory bandwidths and synchronization latencies, while `lumen bench` compares it against the measured execution time $t_{\text{measured}}$.
+Every result identifies one of three levels:
 
-The ratio
-$$\eta = \frac{t_{\text{floor}}}{t_{\text{measured}}} \in (0, 1]$$
-measures how close the engine comes to the physical limits of the machine. Optimization is thus divided into two distinct tasks:
-- **raising efficiency $\eta$ toward $1.0$** (optimizing CPU/GPU kernels, reducing synchronization overhead, and hiding disk reads);
-- **lowering the ceiling $t_{\text{floor}}$ itself** (moving hot layers into VRAM via `--auto`, reducing expert bit widths, or increasing batch size).
+1. **An individual compute kernel** on prepared data. For example, one GEMV without preparing a job for the worker pool.
+2. **A complete operation call**, including implementation selection, dispatch to the pool and waiting for completion.
+3. **A model step**, which executes several operations and changes model state.
 
----
+These measurements answer different questions. A faster GEMV may barely affect a model step if most time goes into other operations or waits. Model-level measures also include decode latency, prefill throughput, memory use and time to first token.
 
-## 2. Hardware Resources and Measurement (`lumen probe`)
+### First launch and repeated work
 
-Each hardware resource is characterized by two numbers: its **theoretical spec limit** and its **measured limit** (the sustainable throughput achieved by the `lumen probe` microbenchmark and stored in `hw-profile.json`):
+Measure cold loading, weight packing and pipeline creation separately. For steady execution, state how the program was warmed up before measurement.
 
-| Resource | Theoretical Spec Source | What `lumen probe` Measures |
-| :--- | :--- | :--- |
-| **DRAM Read per Node** | Channels $\times$ 8 bytes $\times$ memory clock (SMBIOS) | Streaming reads across all worker threads using the exact access pattern of the MoE expert kernel |
-| **VRAM Read** | GPU bus width $\times$ memory clock (CUDA attributes) | Reading a large VRAM buffer with a minimal GEMV-shaped kernel |
-| **PCIe Bus (H2D and D2H)** | PCIe generation and lane width (`sysfs`) | Asynchronous copies of varying buffer sizes between `pinned RAM` and VRAM |
-| **GPU ↔ CPU Crossing** | *(measured only)* | Full flag ping-pong cycle: `cuStreamWriteValue32` $\to$ CPU spin pool $\to$ CPU write $\to$ `cuStreamWaitValue32` |
-| **NVMe Storage** | Rated IOPS and random read latency | Random 4 KiB reads at queue depths (QD) 1, 16, and 64 |
-| **Compute Peak (GPU Tensor Cores / CPU int8)** | Rated peak performance per dtype | Dense matrix microbenchmarks for `mma` (GPU) and `vpdpbusd` (CPU) |
+Also distinguish data that fits in cache from weights read from main memory. Repeating GEMV on one matrix differs from traversing successive weight matrices of a model. The report must identify which case was measured.
 
-Benchmark reports display $\eta$ relative to both the theoretical spec ceiling and the measured hardware ceiling (isolating engine software overhead from hardware memory-controller overhead).
+## Units
 
----
+For dense GEMM with input `[N,K]` and weights `[M,K]`, use:
 
-## 3. Step Model: Critical-Path Ceiling vs. Resource Ceiling
+```text
+TFLOPS = 2*N*M*K / seconds / 1e12
+```
 
-A segment cannot finish faster than its most heavily loaded resource: $t_{\text{seg}} \ge \max(\text{bytes}_r / \text{BW}_r, \text{FLOP} / \text{peak})$. `Program::floor(&HwProfile)` computes two ceilings:
+Here `seconds` is the measured time in seconds. GEMV uses the same formula with `N=1`.
 
-1. **Critical-Path Ceiling (single sequence, batch = 1):**
-   The sum of segment times along the layer dependency chain, accounting for concurrent overlap of independent branches within a layer (such as shared experts on GPU running in parallel with routed experts on CPU), plus the measured latency of every GPU ↔ CPU crossing.
-2. **Resource Ceiling (batching limit):**
-   The quantity $\max_r (\sum \text{bytes}_r / \text{BW}_r)$ summed across the entire step. Achievable only when overlapping work across multiple sequences in a batch.
+The numerator counts only useful arithmetic under this convention. Extra padding, packing and control operations do not increase its FLOP count. Their time counts if they are part of the measured call.
 
-`lumen inspect` prints both ceilings broken down by resource and layer, `lumen bench` compares them against runtime measurements, and `--trace` exports a segment timeline (GPU events and CPU spin-pool timestamps).
+For GB/s, always specify which bytes are counted: logical data volume or measured traffic at a particular memory level. Cache reads and DRAM reads must not silently be treated as the same traffic.
 
----
+## What we compare against
 
-## 4. Reference Rig Ceiling Calculation
+The estimated maximum compute rate depends on:
 
-- **Reference rig:** RTX 5070 Ti 16 GB (GDDR7, 896 GB/s; PCIe 5.0 x16, ~63 GB/s per direction) + Ryzen 9 9950X (dual-channel DDR5-6000, 96 GB/s theoretical peak) + NVMe SSD.
-- **Model and placement ([`examples/example-moe.json`](../../examples/example-moe.json)):** `Qwen3.8-Flash-Next` in LTQ 4.05 bpw; routed experts of 45 out of 48 layers placed in RAM on CPU; 3 layers of experts and all other weights in VRAM on GPU; n-gram table on NVMe disk; context length 262,144 tokens.
+- active core count;
+- instruction width and throughput;
+- data type;
+- processor frequency under the measured workload.
 
-| Resource | Data Read per Decode Token | Volume | Spec Ceiling |
-| :--- | :--- | :---: | :---: |
-| **DRAM (CPU)** | 10 routed experts $\times$ 45 layers at 2.48 MB each | **1.11 GB** | **11.6 ms** |
-| **VRAM (GPU weights)** | 36 Gated DeltaNet layers (1.65 GB) + Hyper-Connections (1.28 GB in fp16) + `lm_head` (0.64 GB) + 12 Full Attention layers (0.48 GB) + shared experts (0.24 GB) + routers (0.13 GB) + 3 expert layers (0.07 GB) + PLE projections (0.07 GB) | **4.54 GB** | **5.1 ms** |
-| **VRAM (GDN state)** | Read and write $36 \times 3\text{ MB}$ `fp32` state matrices | **0.23 GB** | **0.25 ms** |
-| **VRAM (KV at 262k)** | QSA indexer (averaged keys of 65,536 blocks $\times$ 12 layers) + attention ($\le 2048$ positions $\times$ 12 layers) | **~0.25 GB** | **~0.3 ms** |
-| **PCIe (GPU ↔ CPU)** | Input and output of 45 CPU segments at ~5 KB each | **0.45 MB** | 90 crossings $\times$ measured latency |
-| **NVMe Disk** | 16 n-gram rows at 86 bytes each (`TCQ4X` rings), page-cache misses | **$\le 1.4$ KB logical payload** | Overlap assumed; physical read volume and cold latency need measurement |
+Brief boost frequency and a rated maximum do not establish sustained GEMM speed. For GEMV, also estimate read volume and available DRAM or relevant-cache bandwidth. Measure memory bandwidth, inter-chiplet bandwidth and working thread counts on the current machine.
 
-- **Critical-Path Ceiling:** $5.6\text{ ms (GPU)} + 11.6\text{ ms (CPU)} - 0.25\text{ ms (shared-expert overlap)} \approx \mathbf{17\text{ ms}}$ plus 90 crossings — **approximately 58 tokens/s** at 262k context.
-- **Resource Ceiling:** $11.6\text{ ms}$ (DRAM-bound) — approximately 86 tokens/s (unreachable by a single sequence).
-- **Prefill with Expert Streaming (`prefill-compute: "cuda:0"`):** each chunk streams 57 GB of CPU-layer experts over PCIe ($\approx 0.9\text{ s}$ on PCIe 5.0), setting a ceiling of **~1,100 tokens/s** at chunk size 1024 and **~4,500 tokens/s** at chunk size 4096.
+Roofline and `max(compute time, transfer time)` help build an estimate if their assumptions are explicit. A different microbenchmark's speed does not set a strict physical bound for our model step.
 
-### Factors That Lower the Ceiling $t_{\text{floor}}$
-- Moving one layer of routed experts from RAM to VRAM shortens the critical path by roughly 0.23 ms/token at the cost of 1.27 GB of VRAM.
-- Reducing the bit width of CPU experts reduces DRAM read time linearly.
-- Quantizing `Hyper-Connections` matrices (which occupy 1.28 GB in `fp16`, over a quarter of VRAM traffic) directly reduces the GPU portion of the step.
+Label the result's ratio to that estimate as a **ratio to a conditional reference**. For example, reaching 80% of a reference does not itself prove 80% hardware utilization or that a further 20% speedup is available. Report all arithmetic-rate references in TFLOPS as well.
 
----
+## What we check before optimizing
 
-## 5. Target Efficiency Goals ($\eta$)
+First identify where time is spent. On CPU, separate:
 
-Target $\eta$ values relative to the measured hardware ceiling (`lumen probe`):
+1. call preparation;
+2. job publication to workers;
+3. each worker's start time;
+4. computation;
+5. call completion.
 
-| Component | Target $\eta$ |
-| :--- | :--- |
-| **CPU routed-expert kernel (`lumen-cpu`)** | $\ge 90\%$ of measured DRAM bandwidth |
-| **GPU GEMV and Attention kernels** | $\ge 85\%$ of measured VRAM bandwidth |
-| **GPU ↔ CPU flag crossing** | Within measured ping-pong $+ 1\text{ }\mu\text{s}$ |
-| **Step overhead (graph launch, sampling, events)** | $\le 3\%$ of step time |
-| **End-to-end Decode step** | $\eta \ge 0.85$ of critical-path ceiling |
+Sampling locates CPU-time consumption. Available hardware counters help check causes of stalls and traffic volume. The timeline identifies the critical path.
+
+Worker waits may overlap. When several workers wait simultaneously, their waiting times cannot be added and presented as one call's latency.
+
+For Vulkan, separately measure GPU commands, CPU waits, copies and pipeline creation. Use timestamp queries only when supported by the relevant queue. GPU and CPU clock values cannot be subtracted directly without a valid correspondence.
+
+Profilers and validation affect execution. Confirm an apparent improvement in a separate run without them.
+
+Before changing code, state a testable cause: repeated packing, an unnecessary intermediate buffer, too little work per job, uneven matrix partitions or a slow kernel region. Changing the language, compiler or alignment does not by itself explain lost time.
+
+## Making measurements reproducible
+
+Keep the following in the report:
+
+- source or binary version and compiler;
+- CPU, GPU, driver and ISA;
+- shapes, dtype and layout;
+- threading policy and affinity;
+- cache regime, warmup order and repetition count.
+
+Alternate the baseline and candidate when comparing them. Show variation, regressions and complete call cost. Measurements under competing load, such as a game, are not evidence of an optimization's benefit.
+
+Every optimization passes numerical comparisons and memory-bound checks. Choose implementations for different CPUs and GPUs using capabilities and measurements. Users must not need the developer's processor.
+
+Builds and checks under emulation can validate selected correctness scenarios. Measure real ARM performance on the actual device.

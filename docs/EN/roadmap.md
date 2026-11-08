@@ -1,36 +1,89 @@
-# Implementation roadmap
+# Migration to C and Vulkan
 
-Build a small correct execution path first, then justify additional mechanisms with measurements. The phase numbers below retain existing code references; they are milestones, not a requirement to finish every optimization before proceeding. In particular, a hybrid synchronization experiment can run alongside the first GPU work.
+[Русский](../RU/roadmap.md)
 
-**Current position:** the configuration/inspect and format/decoder foundation exists. End-to-end inference does not. The Python golden fixtures required below are still missing; Rust differential decoder tests do not replace them. See [architecture.md](architecture.md) for implemented scope and [execution-design.md](execution-design.md) for proposed mechanisms.
+The goal is a working, verifiable engine that people can contribute to through understandable C code. Technical terms in this plan are explained in the [glossary](glossary.md).
 
-## Milestones and acceptance
+A language change does not itself establish acceleration. Verify correct results, memory use and complete execution time for every migrated part.
 
-| Phase | Deliverable | Evidence needed |
-| :--- | :--- | :--- |
-| 1. Foundation | Types, model component descriptions, placement and `inspect` | Config/selector tests, truthful reporting, and existing dependency-boundary checks |
-| 2. Format interoperability | Container reader, LTQ decoder, external fixtures | Bit-for-bit agreement with Python exports and rejection of malformed input; a native quantizer is not required |
-| 3. First CPU execution | Minimal prepared schedule, reference/CPU execution, one tiny dense model and then a recurrent hybrid, `lumen run` | Logits against an independent implementation; prefill/decode agreement; declared and observed memory bounds |
-| 4. First GPU execution | ABI/build wiring and the kernels needed by those fixtures | CPU/GPU numerical comparison, launch/memory checks, and a small CPU/GPU transfer experiment |
-| 5. Hybrid execution | One model with CPU experts and GPU computation, explicit transfers, basic `probe`/`bench` | Placement-invariant results within tolerances; measured crossing latency, overlap and peak memory; correct completion on error/cancel |
-| 6. Disk tables | Bounded staging and row fetch | Correct rows, cold/hot I/O latency, bounded buffering and error handling; measure available overlap |
-| 7. Measured optimization | Chunked prefill, streaming, repacking/`pack`, selected fusion or graph capture | Differential checks and a reproducible benefit for each adopted optimization |
-| 8. Broader model composition | Additional attention, selection, residual and state mechanisms | Reference parity and resource accounting, including shared and derived representations; no family branches in shared mechanisms |
-| 9. Serving and speculation | Batching, prefix reuse, drafts, chat and HTTP adapters | Sequence isolation, partial acceptance/rollback, cancellation and capacity limits |
-| 10. Media | Preprocessing and encoder/decoder integration | Reference outputs and bounded state for mixed media/text inputs |
+**What exists now:** the Rust implementation contains configuration and `inspect`, LTQ reading, a graph, a synthetic dense-f32 decoder and CPU kernels. **The C library and Vulkan backend are not implemented.** Preserve old results for comparison; they do not establish completion of new stages.
 
-Before phase 3 fixes the execution interfaces, exercise a resource description with shared storage, explicitly derived attention inputs, and recurrent state. Count owners once and include scratch. Define step capacities and state ownership early; implementing full serving can wait until phase 9.
+## Order of work
 
-## Independent quantizer track
+These stages express dependencies. Some work can proceed in parallel: Vulkan experiments may start after buffer and basic-operation contracts, while format support can migrate alongside CPU computation. A real model can be connected before reaching maximum TFLOPS.
 
-Use ready-made research LTQ exports and tiny dense fixtures to develop inference. Develop native calibration, LDLQ/Viterbi, and bit allocation separately, checking decoder compatibility and quantization quality against the research pipeline. Share model loading and lower-level execution, without making generation scheduling a calibration prerequisite. Import Fisher profiles until native backward implementations have their own checks. See [ltq-design.md](ltq-design.md).
+### 1. Minimal C library
 
-## Decisions that need evidence
+Prepare CMake, error statuses, opaque objects, size and overflow checks, CPU references and Unity/CTest tests. Introduce a small internal [backend interface](backends.md) and build-time module registration alongside them.
 
-- Validate CPU/GPU synchronization and graph capture on the target driver before choosing the flag protocol.
-- Measure decoding cost and shared memory/bus contention before assuming bandwidth-bound execution.
-- Test cold NVMe latency against the actual first consumer; small logical reads do not imply hidden I/O.
-- Budget recurrent history, prefix snapshots and temporary buffers before enabling speculation or more concurrent sequences.
-- Treat [performance.md](performance.md) numbers as projections and targets, not completed milestones or required properties of the architecture.
+The interface includes operation support queries, prepared implementations, acceptance and completion. A backend can initially support one operation, but a whole model needs a complete prepared plan. A third production backend is unnecessary for this check.
 
-Keep the existing dependency checks while the crate layout is unchanged. Split or combine crates when actual dependencies and ownership justify it, updating checks together with the code. [Architectural boundaries](architecture.md#9-extensibility-rules-and-architectural-boundaries) remain the guide.
+This stage is complete when the library builds for Windows, Linux and Android arm64 and the first test runs without a Rust runtime. Argument errors, ownership and correct resource release are verified.
+
+A test backend with one operation and controllable delayed completion must connect without changes to models or the planner. Shared checks cover rejection before launch, failure after acceptance, cancellation, RAM transfers and session independence. CPU builds do not depend on disabled-backend SDKs. This tests module boundaries, not another production backend.
+
+### 2. End-to-end CPU execution
+
+Connect small weights, model blocks, `Program` and `Session` into a working synthetic decoder.
+
+This stage is complete when prefill and decode work and logits and state agree with independent fixtures. Shared storage owners and derived K/V must work without extra allocations. The CPU module uses the common interface; session slots are independent and cancellation is safe.
+
+### 3. Optimized CPU computation
+
+Port common C/LLVM kernels, weight preparation and the worker pool.
+
+This stage is complete after reference comparisons and guard-page checks. Test tails and concurrent calls. The hot path has no allocations. Execution profiles and complete GEMM/GEMV call measurements are available.
+
+### 4. Loading a real model
+
+Add configuration, LTQ and weight loading, a supported tokenizer and chat template, and `inspect` and `run` commands.
+
+This stage is complete when token IDs and logits agree with an independent implementation and memory reports truthfully describe usage.
+
+### 5. First Vulkan execution
+
+Add device discovery and capabilities, GPU memory, SPIR-V, required FP32 operations and a small decoder. Vulkan uses the same interface as CPU and the test module. The common planner needs no new device-name branches.
+
+This stage is complete after numerical comparison with CPU and validation checks. Measurements are needed across GPU families and on Android. Missing device capabilities must be reported correctly.
+
+### 6. CPU and GPU working together
+
+Add CPU/GPU data and compute placement, the common RAM route, explicit conversions and operation dependencies. Then connect disk-table loading.
+
+This stage is complete when changing placement preserves results within numerical tolerances. Check rejection for insufficient support, permitted alternative selection during preparation, cancellation, peak memory and crossing latency at p50 and p99.
+
+### 7. Broader computation support
+
+Add further attention and recurrent mechanisms, MoE, LTQ fast paths and fusion with measured benefits.
+
+This stage is complete when each mechanism and the whole model are tested. Common blocks have no model-family branches.
+
+### 8. Applications and multiple requests
+
+Develop CLI and chat, HTTP, batching, prefix reuse, speculation and media support.
+
+This stage is complete when sessions are isolated, queues are bounded and capacity is controlled. Partial acceptance and rollback are tested.
+
+## What survives code replacement
+
+The current Rust code may be removed during the transition. What matters long term is the knowledge and verifiable results it helped establish:
+
+- LTQ v1 and external fixtures;
+- common mathematical block contracts;
+- storage-owner accounting rules;
+- verified numerical tests and independent reference data;
+- measurements identifying the implementation they describe.
+
+Old sources may be archived for reference if useful. The plan does not require continuously maintaining a runnable Rust version until its replacement exists. Before deletion, preserve knowledge, test scenarios and data for checking the new implementation. Archived Rust measurements must not be renamed as C/Vulkan results.
+
+Do not automatically port twenty build units, unused settings, CUDA protocols and additional barriers. Check a concrete use case before fixing each C contract.
+
+Pin exact library versions with a working build. Proposals and open decisions are listed in [dependencies.md](dependencies.md).
+
+The C++ dependency policy and conditional VMA choice remain open. Dynamic backend loading and a stable binary ABI are separate future decisions.
+
+## Separate quantizer work
+
+Calibration and native quantization develop separately from applications. They need model loading and execution, but must not depend on HTTP or the serving scheduler.
+
+Until a native backward path exists, verified research profiles can be imported. Modular forward execution does not mean backward is implemented. Format and quantization details are in the [LTQ design](ltq-design.md).

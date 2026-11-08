@@ -1,5 +1,9 @@
 # `Gemma 4` Model Family
 
+[Русский](../../RU/models/gemma4.md)
+
+This is a reference for the architecture and its implementation requirements, not a report of working Velri execution. The C17 engine composes the model from [common blocks](../blocks.md); support for concrete operations and representations is checked through the [backend registry](../backends.md), starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
+
 The **Gemma 4** family comprises five models (`E2B`, `E4B`, `12B`, `26B-A4B`, `31B`) that alternate **sliding-window attention layers (`sliding`)** with **global full-attention layers (`full`)**.
 
 | Model | Layers (sliding : full) | Sliding Window | Sliding KV | Global Layers: $K = V$ | Shared KV | PLE Module | Notable Features |
@@ -26,7 +30,7 @@ $$K = \text{RoPE}_p(\text{RMSNorm}(\text{raw}) \odot w_k) \quad \text{(norm with
 $$V = \text{RMSNorm}(\text{raw}) \quad \text{(same norm without learned weight and without RoPE)}$$
 $$\implies K = \text{RoPE}_p(V \odot w_k)$$
 
-Because $K$ is uniquely determined by $V$, **`lumen-rs` stores only $V$ in the global-layer KV cache and reconstructs $K$ on the fly inside the attention kernel** (multiplying by $w_k$ and rotating 128 of the 512 dimensions). This halves both global KV cache memory and VRAM read bandwidth during decode. At a 262,144-token context length:
+Because $K$ is uniquely determined by $V$, global layers can **store only $V$ and reconstruct $K$ when computing attention** (multiplying by $w_k$ and rotating 128 of the 512 dimensions). This halves global KV cache storage. Halving reads of stored K/V requires a kernel that derives K at consumption without writing and rereading a full temporary copy. This optimized path is not implemented. The graph explicitly describes the V resource and K derived from it using the norm weight and positions; a backend does not recognize the family by name or automatically allocate a separate K cache. If fused consumption is unsupported, preparation may choose an equivalent decomposition with temporary storage included in the budget; if no supported path exists, it returns an error. At a 262,144-token context length:
 
 | Model | Global KV (Storing $K$ and $V$) | Global KV (Storing $V$ Only) | Sliding KV (Excluding $T_{\max}$ Margin) |
 | :--- | :---: | :---: | :---: |
@@ -48,13 +52,15 @@ On global layers with head dimension $d = 512$ and rotary fraction $p = 0.25$, t
 
 The final `num_kv_shared_layers` layers (20 of 35 in `E2B` and 18 of 42 in `E4B`) have no `k_proj` or `v_proj` projections and allocate no KV cache of their own. Instead, they read the KV cache of the last reference layer of the same type (`sliding` or `full`) preceding the sharing boundary.
 
-During prompt processing (prefill), these final layers write nothing to the KV cache, allowing the `lumen-exec` scheduler to evaluate them only for rows that require output logits ([Section 7 of architecture.md](../architecture.md#7-plan-compiler-lumen-exec-and-step-execution)).
+The plan represents these reads as references to one state resource with explicit dependencies on the reference layer's writes. The shared resource's lifetime and size are accounted for once; additional representations or transfers between devices are accounted for separately.
+
+During prompt processing (prefill), these final layers write nothing to the KV cache. This permits considering evaluation only for rows that require output logits, after checking all dependencies and side effects. The optimization is not implemented; it belongs in [execution preparation](../architecture.md#what-is-done-ahead-of-time-and-at-each-step).
 
 ---
 
 ## 4. Per-Layer Embeddings (`PLE` in E2B and E4B)
 
-- **Lookup table component:** the `embed_tokens_per_layer` tensor of shape $[262\,144, \text{layers} \times 256] \times \sqrt{256}$, indexed by token ID. In `E4B`, this table occupies ~5.6 GB in `bf16` (roughly one-third of all model weights) and, once compressed with `LtqRing` rings, can reside in system RAM or on NVMe disk (`Fetch`).
+- **Lookup table component:** the `embed_tokens_per_layer` tensor of shape $[262\,144, \text{layers} \times 256] \times \sqrt{256}$, indexed by token ID. In `E4B`, this table occupies ~5.6 GB in `bf16` (roughly one-third of all model weights). Once compressed with `LtqRing` rings, RAM or NVMe storage can be considered: preparation must provide row fetching, supported decoding, and delivery to the consumer. This does not promise direct GPU reads of RAM or hidden I/O latency.
 - **Contextual component:** a linear projection of the main token embedding $\times \text{hidden}^{-1/2} \to \text{RMSNorm}$, combined with the table lookup scaled by $1/\sqrt{2}$.
 - **Per-layer injection:** after the MLP on each layer, the model computes $\text{GELU}(W_{\text{gate}} h) \odot \text{ple}_\ell \to W_{\text{proj}} \to \text{RMSNorm} \to + \text{residual}$.
 
@@ -62,9 +68,9 @@ During prompt processing (prefill), these final layers write nothing to the KV c
 
 ## 5. Parallel Dense MLP + MoE (`26B-A4B`) and `Gemma4Assistant` Drafter
 
-- **Parallel MLP + MoE in `26B-A4B`:** on every layer, a dense MLP (`intermediate_size: 2112`) and a 128-expert MoE block (`top-8`, `intermediate_size: 704`) execute in parallel from the same pre-MLP residual input. This allows the GPU to compute the dense MLP concurrently while the CPU computes the routed MoE experts.
+- **Parallel MLP + MoE in `26B-A4B`:** on every layer, a dense MLP (`intermediate_size: 2112`) and a 128-expert MoE block (`top-8`, `intermediate_size: 704`) form independent branches from the same pre-MLP residual input. One possible placement runs the dense MLP on Vulkan and routed experts on CPU. Preparation checks support and adds transfers and the dependency for joining results; actual overlap and speedup require measurement.
 - **Vision attention mask:** `sliding` layers apply the intersection of the sliding window with the union of the causal mask and bidirectional intra-image span mask; global layers remain strictly causal.
-- **`Gemma4Assistant` drafter (`gemma-4-*-assistant`):** a 4-layer speculative drafter without its own `k_proj`/`v_proj` that reads the target model's embedding table and the KV caches of the target's last `sliding` and last `full` layers ([Section 8 of architecture.md](../architecture.md#8-generation-runtime-engine-speculative-decoding-and-multimodality)).
+- **`Gemma4Assistant` drafter (`gemma-4-*-assistant`):** a 4-layer speculative drafter without its own `k_proj`/`v_proj` that reads the target model's embedding table and the KV caches of the target's last `sliding` and last `full` layers. Speculative execution is a separate stage in [roadmap.md](../roadmap.md).
 
 ---
 

@@ -1,6 +1,6 @@
 {
   "model": {
-    "path": "models/qwen3.8-flash-next/model.ltq",
+    "path": "models/qwen3.8-flash-next/model.vtq",
     "compute": "cuda:0",
     "store": "vram:0",
     "input-layer": {

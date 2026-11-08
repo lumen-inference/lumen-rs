@@ -1,0 +1,14 @@
+# Complete universal packed linear kernels
+
+Use executing-plans inline. User explicitly requires finishing working performant universal GEMM/GEMV, not stopping at the prior dot-only backend. Requirements are the conversation and existing checked Linear API.
+
+One build-time LLVM generator describes vector dot microkernels, outer-product microkernels and transpose packing. A shared C scheduling loop lowers to LLVM IR and is optimized together with generated primitives. Hardware metadata comes from LLVM TargetTransformInfo for Cargo TARGET and optional AVX features; no CPU-model schedules and no ARM implementation. All dimensions, strides, bias, tails remain dynamic. No JIT, heap weight copies, or architecture-specific runtime crate.
+
+Ruling: the prior scalar-only design's prohibition on fixed vectors and bounded packing prevented necessary data reuse. Replace that implementation constraint with compiler-derived vector width/register capacity and bounded stack packing. This follows the user's instruction to finish efficient universal kernels. LLVM development tools are build-time only for the optional feature; normal build remains unchanged.
+
+- [x] Task1: compiler capability query and common vector IR generator; test long exceptional reductions in forced profiles, packed 129/257-row strided/tail boundaries, malformed-before-write behavior. Record numerical/mutation RED→GREEN.
+- [x] Task2: common scheduling/packing, all tails, runtime AVX guards; generated path in existing partitioner with metadata geometry. Use independent f64 oracle. No hot heap allocations.
+- [x] Task3: bounded main/short GEMM and cached/streaming GEMV speed validation against frozen prior native and LLVM; inspect loops for spills and reuse. Fix proven bottlenecks, no broad parameter sweeps. Require large-GEMM generated speed comparable to the existing ~4.2 TFLOPS baseline on this host before considering migration done.
+- [x] Task4: all default/feature debug+release tests, MSRV1.89, Clippy/fmt, ARM AArch64 compilation+QEMU actual numerical tests, build-tool failure checks, one independent final source review. Update readable RU/EN docs and exact-source benchmark evidence. Preserve unrelated dirty work, no commit/push unless asked.
+
+Review focus: strict initialized packed/output extents; unaligned inputs and strided rectangles; ISA feature guard includes all compiler-emitted instructions; first/last depth panels and bias application; numerical NaN/Inf semantics and dynamic tails; cross compiler host versus target separation; tool version mismatch; no LLVM runtime libraries; source of hardware metadata and bounded stack sizes. Overall maximum-performance goal remains open unless evidence establishes it; this plan must finish the optimized common implementation and integration, not another slow proof of concept.

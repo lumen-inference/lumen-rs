@@ -1,6 +1,10 @@
 # LTQ v1 Quantization Format Specification (Lumen Trellis Quant)
 
-**LTQ** (*Lumen Trellis Quant*) is the weight quantization format of `lumen-rs`. It is designed to compress neural network weight matrices down to **2–5 bits per weight** and package the entire model (metadata, tokenizer, and weights) into a single self-contained `.ltq` container file.
+[Русский](../RU/ltq-format.md)
+
+This is the precise reference for implementing LTQ readers and writers. For an introduction to the engine, start with the [architecture](architecture.md); terms are defined in the [glossary](glossary.md). The formulas, field sizes, and bit order here define file compatibility and must not be replaced by approximate descriptions.
+
+**LTQ** (*Lumen Trellis Quant*) is the weight quantization format used by Velri. It is designed to compress neural network weight matrices down to **2–5 bits per weight** and package the entire model (metadata, tokenizer, and weights) into a single self-contained `.vtq` container file. The `.vtq` extension changes the file name only: the LTQ v1 magic (`LTQ\0`), version, tensor keys (`.ltq.data` and `.ltq_rows.data`) and byte layout stay unchanged. The existing reader and writer do not depend on the file extension.
 
 This document specifies the mathematical reconstruction model, the $16 \times 16$ tile structure, the format menu, the ring-encoded row lookup tables, and the on-disk binary container layout. The reference encoder and decoder implementation is in [`ltq-research/src/ltq_format.py`](https://github.com/lumen-inference/ltq-research/blob/main/src/ltq_format.py), and the automated bit-exact self-test results (512 Gaussian tiles $\times$ 19 menu formats and 256 rings at $L = 160$ $\times$ 17 ring-eligible formats — 0 mismatches) are recorded in [`results/ltq_format_selftest.json`](https://github.com/lumen-inference/ltq-research/blob/main/results/ltq_format_selftest.json). Quality comparisons against EXL3 and GGUF and the design of the quantizer are covered in [ltq-design.md](ltq-design.md).
 
@@ -15,7 +19,7 @@ When compressing weight matrices from 16-bit floating-point (`bf16`) down to 3�
 LTQ addresses these limitations through three mechanisms:
 
 1. **Input Hadamard Transform (`suh` and $H_{256}$) for Outlier Suppression.**
-   During quantization, blocks of 256 weights along each row are multiplied by a sign-and-scale vector `suh` and rotated by a 256-point Walsh–Hadamard Transform ($H_{256}$). This orthogonal rotation spreads the energy of isolated outliers evenly across all 256 coordinates in the block, making the resulting distribution close to Gaussian. Because the transform is orthogonal, inference does not need to invert it per weight: the engine applies the same fast transform once to the input activation vector $x$ before matrix multiplication.
+   Before quantization, the weights undergo coordinated channel scaling, sign changes, and a blockwise 256-point Walsh–Hadamard transform ($H_{256}$). The orthogonal rotation spreads the energy of isolated outliers across all 256 coordinates in each block, making the distribution closer to Gaussian. The stored `suh` vector defines the signs and scales applied to inference inputs: Section 2 specifies $\tilde{x} = H_{256}(\text{suh} \odot x)$, performed once per input vector. The weight-side transform must preserve that section's reconstruction relation.
 2. **Trellis-Coded Quantization (TCQ) on $16 \times 16$ Tiles.**
    Each matrix is partitioned into $16 \times 16$ tiles (256 weights). Instead of independent per-weight quantization, LTQ uses Ungerboeck Trellis-Coded Quantization: the decoder maintains a 10-bit sliding window of the most recent code bits. At each position, 1 code bit (`codes`) shifts into this 10-bit state, bit parities under format bitmasks select a subset (bucket) in the lookup table `lut`, and the remaining $K - 1$ uncoded bits select the specific level within that subset. During quantization, the Viterbi algorithm searches the trellis for the optimal bit sequence; during inference, decoding reduces to bitwise operations and table lookups.
 3. **Fractional Bitrates (`D2`, `D4`) and Per-Slice Format Assignment (`slices`).**
@@ -66,7 +70,7 @@ The $K - 1$ uncoded bits $u_t$ select a level within subset $\text{label}_t$, wh
 
 $$q_t = \text{gain}[g_{\lfloor t / \text{sub} \rfloor}] \cdot \text{lut}[\text{label}_t \cdot 2^{K - 1} + u_t]$$
 
-Both `lut` (`float32`, $N_{\text{labels}} \cdot 2^{K-1}$ entries) and `gain` (`float32`, $2^h$ entries) are stored explicitly in the `.ltq` file header so that all devices use identical floating-point values without `powf` rounding discrepancies.
+Both `lut` (`float32`, $N_{\text{labels}} \cdot 2^{K-1}$ entries) and `gain` (`float32`, $2^h$ entries) are stored explicitly in the `.vtq` file header. This avoids differences in rounding $2^{(g - (2^h - 1)/2) \cdot \text{step}}$ across CPU and GPU architectures.
 
 ### Fractional Modes (`Frac`)
 Fractional modes constrain the lowest uncoded bits ($u_t \ \& \ 1$) of neighboring positions:
@@ -89,7 +93,7 @@ All fields of a tile are packed as arrays of 16-bit little-endian words `u16` (b
 | :--- | :--- | :--- |
 | **`codes`** | $16$ | Code bits $c_t$: word $r$ holds the 16 bits of tile row $r$, bit $c$ is position $16r + c$. |
 | **`planes`** | $16 \cdot (K - 2)$ | Uncoded bit planes $1 \dots K-2$, 16 `u16` words per bit plane. Omitted when $K = 2$. |
-| **`lsb`** | $16$ / $8$ / $12$ | Lowest uncoded bit (bit 0 of $u_t$): 16 words in `none` mode; 8 words in `d2` mode (bit $q$ shared by pair $2q, 2q+1$); 12 words in `d4` mode (bits $3q, 3q+1, 3q+2$ store positions $4q, 4q+1, 4q+2$, while position $4q+3$ is their `XOR`). |
+| **`lsb`** | $16$ / $8$ / $12$ | Lowest uncoded bit (bit 0 of $u_t$): 256 bits (16 words) in `none` mode; 128 bits (8 words) in `d2` mode (bit $q$ shared by pair $2q, 2q+1$); 192 bits (12 words) in `d4` mode (bits $3q, 3q+1, 3q+2$ store positions $4q, 4q+1, 4q+2$, while position $4q+3$ is their `XOR`). |
 | **`gains`** | $\lceil (256 / \text{sub}) \cdot h / 16 \rceil$ | Packed $h$-bit gain indices $g$. Omitted when $h = 0$. |
 
 Each tile occupies $2 \cdot (16 + 16(K - 2) + |\text{lsb}| + |\text{gains}|)$ bytes — ranging from 64 bytes (`TCQ2X0`) to 168 bytes (`TCQ5X`).
@@ -126,7 +130,7 @@ Effective bits per weight equals $8 \cdot (\text{tile bytes}) / 256 + 8/256\text
 
 ---
 
-## 6. Row Slices and the `.ltq` Container
+## 6. Row Slices and the `.vtq` Container
 
 ### Row Slices (`slices`)
 Each matrix is partitioned horizontally into contiguous row ranges that are multiples of 16 rows (`slices`). Dynamic programming assigns each slice its own format: attention matrices typically use 256-row slices, MLP matrices use 512-row slices, and each MoE expert matrix forms a single slice. The `suh` vector and `d_row`, `e` scale arrays are shared across the full matrix.
@@ -151,7 +155,7 @@ gains   [T][|gains|]   u16
 ```
 where $T = (\text{slice\_rows} / 16) \cdot (K_{\text{pad}} / 16)$ is the number of tiles in the slice, ordered by 16-row bands and then by column block $kb$.
 
-### Binary File Layout (`.ltq`, little-endian)
+### Binary File Layout (`.vtq`, little-endian)
 
 ```text
 Offset    Size    Description
@@ -199,7 +203,7 @@ JSON header schema:
 
 ## 7. Reference Tile Decoder (`decode_tile`)
 
-The following Rust function (`lumen-ltq`) defines the exact semantics of decoding a $16 \times 16$ tile. Vectorized CPU and GPU kernels ([kernels.md](kernels.md)) evaluate multiple weights in parallel using lookup tables, but must match this reference output bit-for-bit:
+The following Rust example, retained from the `lumen-ltq` reference, defines the exact semantics of decoding a $16 \times 16$ tile. It is not an implementation of the new C API. Optimized CPU and GPU kernels ([kernels.md](kernels.md)) must match this reference output bit-for-bit when evaluating multiple weights in parallel:
 
 ```rust
 /// Decodes 256 tile values without row scale:
@@ -254,7 +258,7 @@ fn decode_tile(
 
 ## 8. Quantizer Contract
 
-1. **Reconstruction fidelity:** The reconstructed weights used by the quantizer for error feedback and subsequent layer calibration must match the decoded output of the serialized fields (`d_row`, `e`, `suh` in `fp16`, and `lut`, `gain` tables).
+1. **Reconstruction fidelity:** The reconstructed weights used by the quantizer for error feedback and subsequent layer calibration must match the decoded output of the serialized fields (`d_row` and `suh` in `fp16`, `e` in `int8`, and the `lut`, `gain` tables).
 2. **Tail-biting Viterbi search:** Every tile is quantized via two-pass tail-biting Viterbi search (a 32-position warmup to the middle of the tile followed by a full shifted pass).
 3. **Fractional mode constraints:** The quantizer enforces `D2` / `D4` parity constraints during path search; the decoder reconstructs the implied bits without runtime validation.
 
@@ -276,4 +280,4 @@ Index-addressed lookup tables of shape $[\text{rows}, \text{dim}]$ (token embedd
 ## 10. Outside v1
 
 1. **Packing the block exponent $e$ into dense 5-bit fields** (saving $-0.012$ bits/weight compared to the byte-aligned `int8` representation).
-2. **Backend-specific tile layouts (`CpuBand16` and `GpuWarp`):** on-disk `.ltq` files store the canonical layout of Section 6 (`TileLayout::Canonical`) by default, while repacking into CPU vector bands or GPU warp layouts is performed by the engine at load time or ahead-of-time via `lumen pack` (see [architecture.md](architecture.md)).
+2. **Backend-specific tile layouts (`CpuBand16` and `GpuWarp`):** on-disk `.vtq` files store the canonical layout of Section 6 (`TileLayout::Canonical`) by default. Repacking into CPU vector bands or GPU warp layouts is planned at model load time or ahead of time through `velri pack` (see [architecture.md](architecture.md)); the command is not implemented.
