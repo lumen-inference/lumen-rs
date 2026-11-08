@@ -1,5 +1,5 @@
-target/
-experements/
-models/
-.vscode/
-.claude/
+/docs/benchmarks/
+/docs/superpowers/
+/experements/
+/models/
+/.superpowers/

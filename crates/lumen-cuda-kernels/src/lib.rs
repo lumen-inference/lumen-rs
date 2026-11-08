@@ -1,1 +1,0 @@
-//! CUDA C++ kernels (.cu), their extern "C" launchers and raw driver API bindings (bindgen over cuda.h): LTQ GEMV and GEMM, mgemm, reconstruct + GEMM on CUTLASS, Hadamard-256, row decoding, attention on FlashInfer, DeltaNet, norms, router, sampling; quantizer Viterbi and LDLQ steps. build.rs compiles them with nvcc into a static library.
