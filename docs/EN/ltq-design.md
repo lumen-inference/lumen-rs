@@ -18,7 +18,7 @@ For the bit-level format specification, see [ltq-format.md](ltq-format.md).
 
 The primary accuracy metric for quantized models is mean **KL Divergence (KLD)** of output token distributions relative to the unquantized `BF16` baseline under teacher forcing. Evaluations are run on two held-out traces disjoint from the calibration data: English Nemotron dialogues and a multilingual trace covering Russian, Chinese, German, French, and Spanish.
 
-In experimental benchmarks ([`ltq-research/`](https://github.com/lumen-inference/ltq-research)), LTQ was evaluated against **EXL3** (`exllamav3`) and lookup-table **`IQ*_K`** formats from `GGUF`:
+In experimental benchmarks ([`vtq-research/`](https://github.com/lumen-inference/vtq-research)), LTQ was evaluated against **EXL3** (`exllamav3`) and lookup-table **`IQ*_K`** formats from `GGUF`:
 
 | Model | Architecture | Baseline (at matched bits/weight) | Relative KLD Change of LTQ vs. EXL3 (English / Multilingual, lower is better) |
 | :--- | :--- | :--- | :--- |
@@ -33,7 +33,7 @@ In the research implementation, LTQ quantization on a single GPU runs **2.4–7�
 
 ### Comparison Against Published Quants on `Qwen3.8-27B`
 
-LTQ was compared against published quantizations of `Qwen3.8-27B` at matched sizes: **GSQ-RCO** (GGUF by IST-DASLab with gradient-searched per-tensor type allocation) and **EXL3** (including self-calibrated `SC`). To ensure an exact comparison, decoder linear layers of each quant were reconstructed to `BF16` with identical unquantized embeddings and `lm_head` ([`results/q27_report.txt`](https://github.com/lumen-inference/ltq-research/blob/main/results/q27_report.txt)):
+LTQ was compared against published quantizations of `Qwen3.8-27B` at matched sizes: **GSQ-RCO** (GGUF by IST-DASLab with gradient-searched per-tensor type allocation) and **EXL3** (including self-calibrated `SC`). To ensure an exact comparison, decoder linear layers of each quant were reconstructed to `BF16` with identical unquantized embeddings and `lm_head` ([`results/q27_report.txt`](https://github.com/lumen-inference/vtq-research/blob/main/results/q27_report.txt)):
 
 | Bits/Weight | LTQ KLD (Eng / Multi) | Competitor KLD | KLD Difference |
 | :---: | :---: | :--- | :---: |
@@ -86,7 +86,7 @@ The file format is separate from a device's internal weight representation. Prep
 
 ## References
 
-- LTQ v1 Specification: [ltq-format.md](ltq-format.md); experimental repository: [`ltq-research/`](https://github.com/lumen-inference/ltq-research)
+- LTQ v1 Specification: [ltq-format.md](ltq-format.md); experimental repository: [`vtq-research/`](https://github.com/lumen-inference/vtq-research)
 - M. W. Marcellin, T. R. Fischer, *«Trellis Coded Quantization of Memoryless and Gauss-Markov Sources»*, IEEE Trans. Commun., 1990
 - G. Ungerboeck, *«Channel Coding with Multilevel/Phase Signals»*, IEEE Trans. Inf. Theory, 1982
 - *QTIP: Quantization with Trellises and Incoherence Processing* ([arXiv:2406.11235](https://arxiv.org/abs/2406.11235))

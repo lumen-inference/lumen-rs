@@ -6,7 +6,7 @@ This is the precise reference for implementing LTQ readers and writers. For an i
 
 **LTQ** (*Lumen Trellis Quant*) is the weight quantization format used by Velri. It is designed to compress neural network weight matrices down to **2–5 bits per weight** and package the entire model (metadata, tokenizer, and weights) into a single self-contained `.vtq` container file. The `.vtq` extension changes the file name only: the LTQ v1 magic (`LTQ\0`), version, tensor keys (`.ltq.data` and `.ltq_rows.data`) and byte layout stay unchanged. The existing reader and writer do not depend on the file extension.
 
-This document specifies the mathematical reconstruction model, the $16 \times 16$ tile structure, the format menu, the ring-encoded row lookup tables, and the on-disk binary container layout. The reference encoder and decoder implementation is in [`ltq-research/src/ltq_format.py`](https://github.com/lumen-inference/ltq-research/blob/main/src/ltq_format.py), and the automated bit-exact self-test results (512 Gaussian tiles $\times$ 19 menu formats and 256 rings at $L = 160$ $\times$ 17 ring-eligible formats — 0 mismatches) are recorded in [`results/ltq_format_selftest.json`](https://github.com/lumen-inference/ltq-research/blob/main/results/ltq_format_selftest.json). Quality comparisons against EXL3 and GGUF and the design of the quantizer are covered in [ltq-design.md](ltq-design.md).
+This document specifies the mathematical reconstruction model, the $16 \times 16$ tile structure, the format menu, the ring-encoded row lookup tables, and the on-disk binary container layout. The reference encoder and decoder implementation is in [`vtq-research/src/ltq_format.py`](https://github.com/lumen-inference/vtq-research/blob/main/src/ltq_format.py), and the automated bit-exact self-test results (512 Gaussian tiles $\times$ 19 menu formats and 256 rings at $L = 160$ $\times$ 17 ring-eligible formats — 0 mismatches) are recorded in [`results/ltq_format_selftest.json`](https://github.com/lumen-inference/vtq-research/blob/main/results/ltq_format_selftest.json). Quality comparisons against EXL3 and GGUF and the design of the quantizer are covered in [ltq-design.md](ltq-design.md).
 
 ---
 
@@ -102,7 +102,7 @@ Each tile occupies $2 \cdot (16 + 16(K - 2) + |\text{lsb}| + |\text{gains}|)$ by
 
 ## 5. LTQ v1 Format Menu
 
-The v1 menu defines 19 formats trained via Lloyd–Viterbi optimization on a Gaussian source (`ltq-research/src/train_tcq_x.py`):
+The v1 menu defines 19 formats trained via Lloyd–Viterbi optimization on a Gaussian source (`vtq-research/src/train_tcq_x.py`):
 
 | Format | $K$ | Mode | Subsets | Extra Masks | $h$ | Gain Step | `sub` | `lut` Entries | Bytes / Tile | Bits / Weight ($K=4096$) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -273,7 +273,7 @@ Index-addressed lookup tables of shape $[\text{rows}, \text{dim}]$ (token embedd
 - Ring values are reconstructed using a per-ring `fp16` scale $d$, a block Walsh–Hadamard transform $H_B$ (where $B \le 256$ is the largest power of two dividing $L$: $B = 256$ for $L = 256$, $B = 32$ for $L = 160$), and a table-wide sign vector $\sigma \in \{-1, +1\}^L$:
   $$v = \sigma \odot H_B(d \cdot q)$$
 - On disk, each ring is stored as a contiguous record (`fp16` scale $d$ followed by `codes`, `planes`, `lsb`, `gains`) of $2 + \text{tile\_bytes}(L)$ bytes (for `TCQ4X` at $L = 160$, $86\text{ B}$ vs. $162\text{ B}$ for scaled `int8`), and all rings of a row are stored back-to-back in `{p}.ltq_rows.data` (`uint8`, $[\text{rows}, \text{row\_bytes}]$) alongside `{p}.ltq_rows.signs` (`int8`, $[L]$). Gathering any row from disk or over PCIe therefore requires only a single contiguous read.
-- Benchmark on the `embed_tokens_per_layer` tables of **Gemma 4 E4B** (5.25 GiB in `bf16`, $262\,144 \times 10\,752$, [`results/g4_ple_gemma4.json`](https://github.com/lumen-inference/ltq-research/blob/main/results/g4_ple_gemma4.json)): rotated `TCQ3X` rings compress the table to **1.05 GiB** at KLD `0.0023 / 0.0030` (Wiki / Code), and rotated `TCQ4X` rings compress it to **1.39 GiB** at KLD `0.0010 / 0.0011` (vs. 2.65 GiB and `0.0006` for `int8`), accounting for $3\%$ and $11\%$ of total full-model KLD at 3.0 and 4.5 bpw respectively.
+- Benchmark on the `embed_tokens_per_layer` tables of **Gemma 4 E4B** (5.25 GiB in `bf16`, $262\,144 \times 10\,752$, [`results/g4_ple_gemma4.json`](https://github.com/lumen-inference/vtq-research/blob/main/results/g4_ple_gemma4.json)): rotated `TCQ3X` rings compress the table to **1.05 GiB** at KLD `0.0023 / 0.0030` (Wiki / Code), and rotated `TCQ4X` rings compress it to **1.39 GiB** at KLD `0.0010 / 0.0011` (vs. 2.65 GiB and `0.0006` for `int8`), accounting for $3\%$ and $11\%$ of total full-model KLD at 3.0 and 4.5 bpw respectively.
 
 ---
 

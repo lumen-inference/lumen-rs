@@ -18,7 +18,7 @@
 
 Основная метрика точности квантованной модели — средняя **KL-дивергенция (KLD)** распределения вероятностей токенов относительно исходной модели в `BF16` (при принудительной подстановке эталонных токенов, teacher forcing). Измерения проводились на двух отложенных выборках, не пересекающихся с калибровочными данными: англоязычных диалогах Nemotron и многоязычной трассе (русский, китайский, немецкий, французский и испанский языки).
 
-В экспериментах ([`ltq-research/`](https://github.com/lumen-inference/ltq-research)) формат LTQ сравнивался с **EXL3** (`exllamav3`) и табличными форматами **`IQ*_K`** из `GGUF`:
+В экспериментах ([`vtq-research/`](https://github.com/lumen-inference/vtq-research)) формат LTQ сравнивался с **EXL3** (`exllamav3`) и табличными форматами **`IQ*_K`** из `GGUF`:
 
 | Модель | Архитектура | База сравнения (при равной битности) | Относительное изменение KLD у LTQ против EXL3 (англ. / мультияз., меньше = лучше) |
 | :--- | :--- | :--- | :--- |
@@ -33,7 +33,7 @@
 
 ### Сравнение с опубликованными квантами на модели `Qwen3.8-27B`
 
-Проведено прямое сравнение с опубликованными сборками того же размера: **GSQ-RCO** (GGUF от лаборатории IST-DASLab, где тип каждого тензора подобран градиентным поиском под бюджет) и **EXL3** (включая самокалиброванную сборку `SC`). Для честного сравнения линейные слои декодера каждого кванта реконструировались в `BF16` при одинаковых неквантованных эмбеддингах и `lm_head` ([`results/q27_report.txt`](https://github.com/lumen-inference/ltq-research/blob/main/results/q27_report.txt)):
+Проведено прямое сравнение с опубликованными сборками того же размера: **GSQ-RCO** (GGUF от лаборатории IST-DASLab, где тип каждого тензора подобран градиентным поиском под бюджет) и **EXL3** (включая самокалиброванную сборку `SC`). Для честного сравнения линейные слои декодера каждого кванта реконструировались в `BF16` при одинаковых неквантованных эмбеддингах и `lm_head` ([`results/q27_report.txt`](https://github.com/lumen-inference/vtq-research/blob/main/results/q27_report.txt)):
 
 | Бит/вес | KLD у LTQ (англ. / мультияз.) | KLD у соперника | Разница KLD |
 | :---: | :---: | :--- | :---: |
@@ -86,7 +86,7 @@
 
 ## Источники
 
-- Спецификация формата LTQ v1: [ltq-format.md](ltq-format.md); репозиторий экспериментов: [`ltq-research/`](https://github.com/lumen-inference/ltq-research)
+- Спецификация формата LTQ v1: [ltq-format.md](ltq-format.md); репозиторий экспериментов: [`vtq-research/`](https://github.com/lumen-inference/vtq-research)
 - M. W. Marcellin, T. R. Fischer, *«Trellis Coded Quantization of Memoryless and Gauss-Markov Sources»*, IEEE Trans. Commun., 1990
 - G. Ungerboeck, *«Channel Coding with Multilevel/Phase Signals»*, IEEE Trans. Inf. Theory, 1982
 - *QTIP: Quantization with Trellises and Incoherence Processing* ([arXiv:2406.11235](https://arxiv.org/abs/2406.11235))
