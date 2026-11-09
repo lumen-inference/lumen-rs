@@ -164,6 +164,8 @@ Sections: [model and text](#model-and-text), [model blocks](#model-blocks), [eng
 
 **FMA** — the operation `a × b + c` with one rounding of the result. Performance calculations usually count it as two arithmetic operations per element.
 
+**Accumulator** — a variable holding a running sum. Its number format determines when intermediate results are rounded.
+
 **NaN, Inf, nonfinite** — special floating-point values: NaN denotes a not-a-number result, and Inf denotes infinity; both are nonfinite values. Their permitted behavior must be defined separately.
 
 **Bitwise equality** — the stored bits must match, including the sign of zero. A small numerical error is still a failure.
