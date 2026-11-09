@@ -166,6 +166,14 @@ Sections: [model and text](#model-and-text), [model blocks](#model-blocks), [eng
 
 **NaN, Inf, nonfinite** — special floating-point values: NaN denotes a not-a-number result, and Inf denotes infinity; both are nonfinite values. Their permitted behavior must be defined separately.
 
+**Bitwise equality** — the stored bits must match, including the sign of zero. A small numerical error is still a failure.
+
+**NaN payload; canonical NaN** — NaN has several possible bit patterns. The payload is part of those bits; a canonical NaN is one explicitly chosen representation.
+
+**Subnormal; gradual underflow** — very small nonzero floating-point values with reduced precision, and keeping them instead of abruptly replacing them with zero.
+
+**Round-to-nearest, ties-to-even** — choose the nearest representable number; if two are equally close, choose the one whose last significand bit is zero.
+
 **LLVM IR** — an intermediate program representation from which LLVM generates machine code for a selected platform. **TTI** provides the compiler with information about the target architecture's capabilities and operation costs.
 
 **Target triple** — a string describing the compiler's target platform, including its architecture and OS or environment information. **Baseline CPU** in a build profile means the platform's baseline capabilities. Such code can still use SIMD; baseline does not necessarily mean scalar computation.

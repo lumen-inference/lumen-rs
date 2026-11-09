@@ -2,6 +2,8 @@
 
 [Русский](../RU/cpu-performance.md)
 
+**Current C implementation:** see [CPU linear](cpu-linear.md). The historical FP32 fast paths below use tolerance checks and do not meet the new bitwise-equality contract. Their speed is not the speed of the new exact C kernels.
+
 > Historical measurement reports, raw experimental data and old source snapshots are kept locally under `docs/benchmarks/` and excluded from Git. Plain paths to these artifacts are references, not download links.
 
 This document records the existing implementation and its measurement history. For the general approach, start with the [kernel overview](kernels.md) and [measurement rules](performance.md). Terms are defined in the [glossary](glossary.md).

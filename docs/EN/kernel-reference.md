@@ -2,6 +2,8 @@
 
 [Русский](../RU/kernel-reference.md)
 
+**Current C implementation:** see [CPU linear](cpu-linear.md). The historical FP32 fast paths below use tolerance checks and do not meet the new bitwise-equality contract. Their speed is not the speed of the new exact C kernels.
+
 > Historical measurement reports, raw experimental data and old source snapshots are kept locally under `docs/benchmarks/` and excluded from Git. Plain paths to these artifacts are references, not download links.
 
 Implementation snapshot as of **November 8, 2026**, before removal of the current code. This document preserves the formulas, data layouts, and execution rules needed to reconstruct the kernels in the new engine. The old Rust files are not needed to understand the algorithms; their names are listed at the end for comparison with the archive.

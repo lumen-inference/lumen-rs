@@ -10,6 +10,8 @@ This is the target architecture. The earlier Rust prototype provided configurati
 
 This document explains the overall structure. Definitions are collected in the [glossary](glossary.md); the [documentation index](README.md) suggests a reading order.
 
+The first concrete C component is the [CPU linear module](cpu-linear.md), with build instructions and exact reference checks. It does not yet implement the runtime or common backend interface.
+
 ## What happens when a model runs
 
 Suppose an application sends a request to the engine and asks it to continue some text.

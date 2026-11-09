@@ -2,6 +2,8 @@
 
 [Русский](../RU/kernels.md)
 
+**Implemented C component:** the [CPU linear module](cpu-linear.md) now provides prepared GEMV/GEMM and exact reference checks. The rest of this page describes the broader backend plan.
+
 This document explains how to move model computations into the new engine: the rules kernels must follow, how CPU and GPU variants are selected, and how results are checked. Terms are in the [glossary](glossary.md); the exact existing CPU implementation is described in the [GEMM/GEMV reference](kernel-reference.md).
 
 **Status:** requirements and migration order. Measurements in [cpu-performance.md](cpu-performance.md) describe the existing Rust/C/LLVM path. They do not mean the new C engine is ready. Vulkan kernels are not implemented; research CUDA results are not results of the new backend either.
@@ -16,7 +18,7 @@ A backend reports support through a query describing the complete operation, inc
 
 A support response specifies layout, alignment, temporary and persistent memory before final buffer allocation. At submission, the prepared implementation receives only the declared resources and bounded dynamic parameters.
 
-The reference checks the formula and state changes. It may accumulate in FP64 even if the fast kernel uses FP32. Every operation defines numerical tolerance and behavior for NaN and infinities. Acceleration preserves these rules.
+The reference checks the formula and state changes. It may accumulate in FP64 even if the fast kernel uses FP32. Every operation defines its numerical contract and behavior for NaN and infinities. The new CPU linear operation requires bitwise equality with its FP64-accumulating reference; FP32 accumulation with a tolerance does not satisfy it. Acceleration preserves the operation contract.
 
 ## CPU: a common computation description
 

@@ -12,7 +12,7 @@ Engine code and public headers are planned in **C17**, using structs and functio
 
 The internal [backend interface](backends.md) also uses C17, opaque resources and function tables. This does not turn the application API into a stable ABI for third-party plugins.
 
-**CMake and Ninja** are proposed for the build. CMake describes how to build the library, applications and tests, and how to generate compute kernels. Ninja executes those actions.
+**CMake and Ninja** are used by the first [C CPU linear module](cpu-linear.md); the full engine build remains to be implemented. CMake describes how to build the library, applications and tests, and how to generate compute kernels. Ninja executes those actions.
 
 Set three properties for our C targets:
 

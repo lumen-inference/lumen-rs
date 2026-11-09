@@ -12,7 +12,7 @@ A configuration file in `velri` is a JSON document that defines:
 1. **The model and the placement of its components across hardware devices** (`model` section).
 2. **Runtime and backend parameters**: context length, KV cache quantization, CPU and disk thread pools, CUDA prefill chunking, and HTTP server settings.
 
-At load time, the configuration is validated and resolved once into a flat `PlacementPlan` ([lumen-config implementation](../../crates/lumen-config/src/lib.rs)). The compute path receives resolved settings, not the original JSON.
+At load time, the configuration is validated and resolved once into a flat `PlacementPlan` (historical source: `crates/lumen-config/src/lib.rs`). The compute path receives resolved settings, not the original JSON.
 
 Example configurations are located in [`examples/`](../../examples/):
 - [`examples/example-dense.json`](../../examples/example-dense.json) — 27B hybrid dense model (`Qwen3.8-27B`).

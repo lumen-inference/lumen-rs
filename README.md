@@ -10,7 +10,7 @@ Start with the [architecture](docs/EN/architecture.md), learn how to [assemble m
 
 The earlier Rust prototype provided: configuration and `lumen inspect`, LTQ container validation and reference decoding, reusable computation blocks, CPU execution preparation, and a synthetic dense-f32 decoder. Its CPU kernels use Rust, C and common LLVM IR generation. AVX2/AVX-512 checks and ARM tests under QEMU exist; emulation tests do not establish performance on physical ARM hardware.
 
-**The C engine and Vulkan backend are designed but not implemented yet.** Real-model text generation, hybrid offload, serving and a native quantizer remain planned work. Documentation distinguishes this target design from existing APIs.
+**The first C CPU linear module is implemented and tested**: prepared FP32 weights, sequential FP64 arithmetic, bitwise reference checks, base/AVX2/AVX-512 variants and a shared ARM algorithm. [Build instructions and exact contract](docs/EN/cpu-linear.md). The C engine runtime and Vulkan backend are not implemented yet. Real-model text generation, hybrid offload, serving and a native quantizer remain planned work. Documentation distinguishes this target design from existing APIs.
 
 In a checkout of the historical Rust prototype, the decoder example runs with:
 
@@ -47,6 +47,7 @@ English and Russian pages cover the same topics, examples and requirements. Each
 | [Execution](docs/EN/execution-design.md) | [Исполнение](docs/RU/execution-design.md) | CPU/GPU dependencies, staging and prepared work |
 | [Configuration](docs/EN/config.md) | [Конфигурация](docs/RU/config.md) | Proposed placement and backend settings |
 | [Kernels](docs/EN/kernels.md) | [Кернелы](docs/RU/kernels.md) | Common contracts, CPU/LLVM and Vulkan compute |
+| [C linear module](docs/EN/cpu-linear.md) | [C-модуль Linear](docs/RU/cpu-linear.md) | Build, exact arithmetic, preparation and memory contracts |
 | [GEMM/GEMV reference](docs/EN/kernel-reference.md) | [Устройство GEMM/GEMV](docs/RU/kernel-reference.md) | Preserved formulas, weight packing and execution rules |
 | [Performance](docs/EN/performance.md) | [Производительность](docs/RU/performance.md) | Profiling, TFLOPS, conditional ceilings and reproducibility |
 | [API](docs/EN/api.md) | [API](docs/RU/api.md) | Ownership, errors, sessions and applications |

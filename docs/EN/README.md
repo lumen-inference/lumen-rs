@@ -46,3 +46,5 @@ Experiment reports retain their measurement conditions. Their numbers cannot be 
 ## Keeping translations in sync
 
 Russian and English pages describe the same decisions, examples and limits. When a contract, formula, example or implementation status changes, update both versions in the same change. Every page starts with a link to the other language. Historical command, file and measurement names are retained so references remain verifiable.
+
+The first implemented C kernel is documented in [CPU linear](cpu-linear.md), including build and exactness checks.
