@@ -2,6 +2,8 @@
 
 [Русский](../RU/execution-design.md)
 
+**Project ownership:** the computation contracts and implementations on this page belong to **Velri-lib**. Velri uses them through the library API; it owns model and request policy. See the [project boundary](velri-lib.md).
+
 Terms used in this document are explained in the [glossary](glossary.md).
 
 **Status: execution design.** This document refines the [architecture](architecture.md). It does not describe an implemented Vulkan runtime. Before accepting an optimization, verify computation results, resource lifetimes and complete execution latency.

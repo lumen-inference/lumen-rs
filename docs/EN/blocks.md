@@ -2,6 +2,8 @@
 
 [Русский](../RU/blocks.md)
 
+Common mathematical blocks belong to Velri-lib; model-family adapters in Velri choose, parameterize and connect them. See the [project boundary](velri-lib.md).
+
 A new architecture should not require writing the entire engine again. We want to describe a model using reusable parts: choose suitable blocks, set their parameters, and connect them in the required order.
 
 **Status:** this document describes the future C and Vulkan implementation. A mechanism appearing in an example does not mean its kernel is ready. The existing Rust API and its limitations are documented in [rust-blocks.md](rust-blocks.md). Terms are defined in the [glossary](glossary.md).

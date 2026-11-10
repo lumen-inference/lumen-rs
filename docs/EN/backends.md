@@ -2,7 +2,9 @@
 
 [Русский](../RU/backends.md)
 
-A backend executes operations on a device. Velri's first two backends are **CPU** and **Vulkan**. The engine and internal backend interface use C17. Vulkan GPU kernels use GLSL and ship as SPIR-V.
+**Project ownership:** the computation contracts and implementations on this page belong to **Velri-lib**. Velri uses them through the library API; it owns model and request policy. See the [project boundary](velri-lib.md).
+
+A backend executes operations on a device. Velri's first two backends are **CPU** and **Vulkan**. The engine and internal backend interface use C23. Vulkan GPU kernels use GLSL and ship as SPIR-V.
 
 **Status: interface design.** The C types and `src/` layout below are not implemented. They define proposed boundaries for the new engine, not the current Rust API. Terms are defined in the [glossary](glossary.md).
 

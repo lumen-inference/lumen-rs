@@ -2,11 +2,13 @@
 
 [Русский](../RU/architecture.md)
 
+The computation layer is a separate project, **Velri-lib**. It owns operations, reusable mathematical blocks, graphs, preparation, device execution and compute memory. Velri owns model descriptions, file loading and inference requests. [Project boundary and build](velri-lib.md).
+
 Velri is an engine for running neural network models. It should load a model, perform its computations on the available hardware, and return a result to the application. For a language model, this usually means scores for the next token, from which a continuation can be selected.
 
-We are designing the engine in **C17, with CPU and Vulkan as the first two backends**, for Windows, Linux, and Android ARM64. Other backends will connect through a common internal C interface. C is the engine language; Vulkan is the GPU API, with kernels written in GLSL and compiled to SPIR-V.
+We are designing the engine in **C23, with CPU and Vulkan as the first two backends**, for Windows, Linux, and Android ARM64. Other backends will connect through a common internal C interface. C is the engine language; Vulkan is the GPU API, with kernels written in GLSL and compiled to SPIR-V.
 
-This is the target architecture. The earlier Rust prototype provided configuration loading, `inspect`, LTQ validation, a computation graph, a test dense-f32 decoder with synthetic weights, and CPU kernels. The C library, Vulkan execution, and generation with a real model are not ready yet. Historical Rust package names retain the `lumen-*` prefix. Project references and paths in the documentation use `velri`.
+This is the target architecture. The earlier Rust prototype provided configuration loading, `inspect`, LTQ validation, a computation graph, a test dense-f32 decoder with synthetic weights, and CPU kernels. The C CPU linear prototype has been extracted into Velri-lib; the C graph, common executor, Vulkan and real-model generation are not ready yet. Historical Rust package names retain the `lumen-*` prefix. Project references and paths in the documentation use `velri`.
 
 This document explains the overall structure. Definitions are collected in the [glossary](glossary.md); the [documentation index](README.md) suggests a reading order.
 
@@ -116,7 +118,7 @@ Autotuning can compare execution strategies, but it must have a bounded budget a
 
 ## What the Vulkan backend requires
 
-The proposed baseline is **Vulkan 1.1 compute with FP32**. The backend checks whether the device supports each required operation, data format, and task size. Faster variants may use FP16, BF16, integer dot instructions, or cooperative matrices when the necessary capabilities are available. No fixed subgroup size is assumed. Capability checks matter more than the vendor name. [Vulkan guide](https://docs.vulkan.org/guide/latest/querying_extensions_features.html).
+The proposed API baseline is **Vulkan 1.1 compute**. Target data formats are F64, FP16, BF16 and INT8; support for storage, arithmetic and accumulation is checked separately. FP32 may be an internal accumulator or conversion format, not the universal model format. The backend checks whether the device supports each required operation, data format, and task size. Faster variants may use FP16, BF16, integer dot instructions, or cooperative matrices when the necessary capabilities are available. No fixed subgroup size is assumed. Capability checks matter more than the vendor name. [Vulkan guide](https://docs.vulkan.org/guide/latest/querying_extensions_features.html).
 
 The backend manages GPU memory, compute pipelines, descriptions of resources available to shaders, command buffers, and queues. Shaders ship as SPIR-V. All of this stays inside the backend: users of the public C API do not manage Vulkan objects. Pipeline creation and descriptor preparation happen during loading or preparation, rather than again for every token.
 
@@ -134,24 +136,27 @@ New mathematics gets a simple reference implementation. Compare an optimized ker
 
 The public library reports errors to the calling application and does not terminate its process. Long-lived objects use opaque C handles. They have matching creation and release operations; borrowed data has a documented lifetime. Concurrency and cancellation rules are described in the [API](api.md).
 
-## How the code will be organized
+## How the projects are organized
 
-Start with one `velri` library, separately built optional backends, and separate applications. A module is a group of C files with a small internal interface. Each such directory does not need to become a separate library.
+Velri and Velri-lib have separate Git repositories, CMake builds and tests. Velri
+links the library's exported target; it does not include private source headers
+or retain a second kernel implementation. [Build instructions](velri-lib.md).
 
-| Planned directory | Contents |
+| Project / directory | Responsibility |
 | :--- | :--- |
-| `include/velri/` | Public C API: object creation, execution, statuses, and diagnostics |
-| `src/core/` | Common types, tensor and storage descriptors, size validation, graph |
-| `src/model/` | Model-family descriptions and common blocks |
-| `src/format/` | Weight and LTQ reading, format and offset validation |
-| `src/plan/` | Placement and kernel selection, data lifetimes, prepared jobs |
-| `src/runtime/` | Sessions, steps, token selection, completion, and cancellation |
-| `src/backend/interface.h`, `src/backend/registry.c`, `src/backend/common/` | Internal C interface, registered modules, common helpers, and RAM transfers |
-| `src/backend/cpu/`, `src/backend/vulkan/`, future modules | Kernels, device resources, queues, and execution |
-| `src/platform/` | OS threads, hardware information, file mapping, clocks, library loading |
-| `apps/`, `tools/` | Command line, server, quantizer, and code generator |
+| Velri: `include/velri/` | Planned application API for models and requests |
+| Velri: `src/model/`, `src/format/` | Model adapters, topology, configuration and weight files |
+| Velri: `src/runtime/`, `apps/` | Requests, batching policy, generation and applications |
+| Velri-lib: `include/velri_lib/` | Computation-library C interface |
+| Velri-lib: `src/core/`, `src/ops/`, `src/blocks/`, `src/graph/` | Values, storage, mathematical mechanisms and graphs |
+| Velri-lib: `src/plan/`, `src/runtime/` | Memory and kernel selection, jobs, execution slots and completion |
+| Velri-lib: `src/backend/`, `src/platform/` | Device execution, CPU workers, GPU queues and OS facilities |
 
-This is a future layout. Start with the CPU library and tests; Vulkan and HTTP are enabled separately. The server and quantizer are not compute-core dependencies. Common blocks do not depend on Vulkan, SIMD instructions, or family names; backends do not read model configs; platform code knows nothing about tensors. Preparation connects them through opaque resources, operation descriptions, and C function tables. A static registry explicitly includes modules selected at build time. The public application API is separate from this internal interface. Dynamic plugins are not needed at the first stage.
+Only the CPU linear module and engine integration test exist today; the other
+modules remain planned. Generic blocks receive mathematical parameters, never
+model-family conditionals. The engine schedules requests; the library schedules
+compute jobs, using one context-owned CPU pool. Optional backends stay within
+Velri-lib and do not become mandatory engine dependencies when disabled.
 
 First establish a verifiable path: small weights → graph → preparation → CPU execution → checked result. Preserve independent Python fixtures and reference results for comparison. Keeping the Rust implementation runnable until the new path is ready is not required. First check the common interface with a small backend that has limited operation support and controllable completion delay. Then add real models, Vulkan, and cooperation between devices. Old crates should not become C libraries one for one. Before removing old code, preserve the necessary reference data, measurements, and algorithm descriptions; CPU kernels already have a [separate document](kernel-reference.md).
 

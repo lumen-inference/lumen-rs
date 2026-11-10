@@ -2,6 +2,8 @@
 
 [Русский](../RU/api.md)
 
+This is the proposed **Velri engine API**. Computation resources and execution live in Velri-lib behind it; token IDs, Model and Session are engine concepts. Program wraps a library execution plan and Context uses a library device context. Velri-lib does not depend on these engine objects. See the [project boundary](velri-lib.md).
+
 Terms used in this document are explained in the [glossary](glossary.md).
 
 **Status: proposed C API and applications.** Public C headers do not exist yet. The current Rust CLI implements `inspect`; generation, serving and quantization commands are not ready. This document describes how the future interfaces should work. Mentioning a function here does not mean it can already be called.

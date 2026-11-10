@@ -2,6 +2,8 @@
 
 [Русский](../RU/kernels.md)
 
+**Project ownership:** the computation contracts and implementations on this page belong to **Velri-lib**. Velri uses them through the library API; it owns model and request policy. See the [project boundary](velri-lib.md).
+
 **Implemented C component:** the [CPU linear module](cpu-linear.md) now provides prepared GEMV/GEMM and exact reference checks. The rest of this page describes the broader backend plan.
 
 This document explains how to move model computations into the new engine: the rules kernels must follow, how CPU and GPU variants are selected, and how results are checked. Terms are in the [glossary](glossary.md); the exact existing CPU implementation is described in the [GEMM/GEMV reference](kernel-reference.md).
@@ -18,7 +20,7 @@ A backend reports support through a query describing the complete operation, inc
 
 A support response specifies layout, alignment, temporary and persistent memory before final buffer allocation. At submission, the prepared implementation receives only the declared resources and bounded dynamic parameters.
 
-The reference checks the formula and state changes. It may accumulate in FP64 even if the fast kernel uses FP32. Every operation defines its numerical contract and behavior for NaN and infinities. The new CPU linear operation requires bitwise equality with its FP64-accumulating reference; FP32 accumulation with a tolerance does not satisfy it. Acceleration preserves the operation contract.
+The reference checks the formula and state changes. It may accumulate in FP64 even if the fast kernel uses FP32. Every operation defines its numerical contract and behavior for NaN and infinities. The retained CPU linear prototype keeps its original bitwise checks. Future F64, FP16, BF16 and INT8 operations declare storage, accumulator, output and numerical requirements separately; they do not inherit a blanket sequential-FP64 requirement. Acceleration preserves the operation contract.
 
 ## CPU: a common computation description
 
@@ -36,7 +38,7 @@ Measure single-token GEMV, small batches and prefill GEMM separately. In each ca
 
 ## Vulkan: start with a verifiable baseline
 
-The first GPU kernel set must execute a small model end to end. It needs FP32 GEMM/GEMV, normalization, activations, residual addition, positional transforms and attention. Kernels use GLSL compute and compile to SPIR-V ahead of time. The host engine controlling their execution is written in C.
+The first GPU kernel set must execute a small model end to end. It needs GEMM/GEMV, normalization, activations, residual addition, positional transforms and attention in the chosen model formats. F64, FP16, BF16 and INT8 paths are introduced with explicit storage, arithmetic and accumulation capability checks. Kernels use GLSL compute and compile to SPIR-V ahead of time. The host engine controlling their execution is written in C.
 
 The baseline uses ordinary storage buffers and checked Vulkan 1.1 limits. Workgroup size, group-shared memory and buffer sizes must fit device capabilities. A subgroup cannot be assumed to have 32 or 64 participants: check its limits and required operations before choosing a kernel. See the [Khronos subgroup guide](https://docs.vulkan.org/guide/latest/subgroups.html).
 

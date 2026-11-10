@@ -2,7 +2,9 @@
 
 [Русский](../RU/README.md)
 
-Velri should run models on CPU and GPU, including when weights do not fit entirely in GPU memory. The new engine's main language is C17. CPU and Vulkan are its first two backends; other backends will connect through the same internal C interface.
+Computations are being separated into **Velri-lib**. Start with the [project boundary and build instructions](velri-lib.md) to distinguish library work from model/request work.
+
+Velri should run models on CPU and GPU, including when weights do not fit entirely in GPU memory. The new engine's main language is C23. CPU and Vulkan are its first two backends; other backends will connect through the same internal C interface.
 
 **These documents preserve the experience from the earlier Rust prototype.** It could read settings, validate LTQ and run a small synthetic decoder on CPU. The C/Vulkan engine and real-model execution remain to be implemented. Describing a design below does not mean its implementation is ready.
 

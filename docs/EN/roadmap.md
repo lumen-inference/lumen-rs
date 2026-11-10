@@ -6,7 +6,7 @@ The goal is a working, verifiable engine that people can contribute to through u
 
 A language change does not itself establish acceleration. Verify correct results, memory use and complete execution time for every migrated part.
 
-**What exists now:** the Rust implementation contains configuration and `inspect`, LTQ reading, a graph, a synthetic dense-f32 decoder and CPU kernels. **The C library and Vulkan backend are not implemented.** Preserve old results for comparison; they do not establish completion of new stages.
+**What exists now:** the CPU linear prototype, references and tests have been extracted into the separate Velri-lib project. Velri consumes its pinned revision and checks the CMake/header boundary. The generic graph, executor, target F64/FP16/BF16/INT8 paths, Vulkan and real-model inference are not implemented. Earlier Rust results remain historical evidence. See [project boundaries](velri-lib.md).
 
 ## Order of work
 
@@ -42,7 +42,7 @@ This stage is complete when token IDs and logits agree with an independent imple
 
 ### 5. First Vulkan execution
 
-Add device discovery and capabilities, GPU memory, SPIR-V, required FP32 operations and a small decoder. Vulkan uses the same interface as CPU and the test module. The common planner needs no new device-name branches.
+Add device discovery and capabilities, GPU memory, SPIR-V, operations for the selected model formats and a small decoder. Vulkan uses the same interface as CPU and the test module. The common planner needs no new device-name branches.
 
 This stage is complete after numerical comparison with CPU and validation checks. Measurements are needed across GPU families and on Android. Missing device capabilities must be reported correctly.
 

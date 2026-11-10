@@ -2,6 +2,8 @@
 
 [Русский](../RU/cpu-linear.md)
 
+**Historical implementation snapshot:** this module and its tests now live in the separate Velri-lib checkout. Paths and build commands below refer to that library, not the Velri engine tree. Use its `include/velri_lib/linear.h` header and `VelriLib::cpu_linear` target. See the [current integration instructions](velri-lib.md). The prototype retains its original numerical contract; future formats do not inherit a blanket bitwise requirement.
+
 Velri now has a standalone **internal CPU linear kernel** in `src/backend/cpu/`.
 It computes `Y = X × Wᵀ + bias`, with one input row for GEMV or several for GEMM.
 This is a tested building block for the C engine. The graph, worker pool, public
@@ -15,8 +17,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The build requires CMake 3.21 or later and a C17 compiler. Clang and GCC are
-supported by this initial build. There are no downloaded dependencies. The
+The build requires CMake 3.21 or later and Clang 18+ or GCC 14+ in C23 mode.
+Configuration checks that the compiler accepts `-std=c23`. There are no downloaded dependencies. The
 library needs neither Rust nor LLVM at runtime. Clang uses LLVM during compilation;
 GCC also builds the same C source.
 
@@ -66,8 +68,10 @@ as performance of this C implementation.
 ## How the kernel gets faster
 
 The common source is `linear_kernel.c`. CMake compiles it with different tile
-sizes and target instructions, then generates the variant table. There is no
-separate ARM algorithm and no processor-model name in the arithmetic code.
+sizes and target instructions, then generates the variant table. Small AVX2
+arithmetic tiles live in `linear_avx2.h`; the API, packing and numerical contract
+are shared. The portable C path also builds for ARM64. No arithmetic code checks
+a processor-model name.
 
 SIMD lanes calculate different output features. Each output retains its original
 K order. Fully unrolling the short column loop lets the compiler hold sums in
@@ -79,10 +83,26 @@ needs at most 48 bits and fits exactly in FP64's 53 bits. Its exponent also fits
 The reference keeps separate multiply and add; the optimized path may fuse them.
 This argument does not allow reassociating the sum or using FP32 FMA instead.
 
-GEMM processes two input rows together, sharing weight loads and conversion to
-FP64. It finishes the rows of one weight tile before moving to the next tile,
-improving cache reuse. A narrower row-pair tile keeps AVX2 accumulator pressure
-within its register budget. GEMV uses one row and more independent output sums.
+AVX2 GEMV loads four FP32 weights directly into each FP64 vector. This avoids
+GCC's extra wide loads and vector-half extraction in the original scalar C loop.
+The same primitive handles an odd GEMM row. With C=32, K≤2048 and at least eight
+output tiles per call, GEMV first expands the input into a bounded 16 KiB stack
+buffer. Other sizes read the original input directly. The copy is included in
+execution time, is private to the call, and does not change prepared weights.
+
+The main AVX2 GEMM path processes three rows by sixteen columns. Its inner loop
+uses twelve accumulator registers, three input registers and one weight register.
+A small assembly primitive fixes this assignment: a compiler-generated 3×16 loop
+spilled an accumulator on every K step. The matrix traversal remains C. It groups
+up to 24 input rows and 128 K entries, reusing a 16 KiB weight panel. FP64 partial
+sums take 6 KiB and temporary expanded inputs take 3 KiB, plus a small row-tail
+buffer. Sums carry across K panels without rounding to FP32; bias is added once.
+
+Narrower, short-K and other ISA variants retain the common row-pair path. Every
+path handles incomplete tiles and naturally aligned inputs. Bias and no-bias
+finishing loops are separate, avoiding unnecessary masked loads when bias is absent.
+Tests include cancellation across K panels, row-group boundaries, special values,
+and inaccessible guard pages; sanitizers alone cannot check assembly loads.
 
 ## Preparation and memory
 
@@ -146,7 +166,125 @@ compiler with the corresponding runtimes installed. Tests also use guard pages
 and concurrent shared-weight calls on POSIX. A passing arithmetic test alone
 does not establish correct memory access or thread-safe ownership.
 
-## Exact-kernel measurements, 10 November 2026
+## Check how GEMV scales across cores
+
+Linux has a separate diagnostic with persistent workers:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVELRI_BUILD_PARALLEL_BENCHMARK=ON
+cmake --build build
+lscpu -e=CPU,CORE,SOCKET,NODE
+./build/bench_linear_parallel auto 1024 1024 0,1,2,3 7 normal 16
+```
+
+Replace `0,1,2,3` with available CPU IDs from your machine. First choose one
+logical CPU per physical core; then try adding the SMT siblings. CPU numbering
+does not reliably tell you which threads share a core. The tool checks the
+process affinity and rejects unavailable or duplicate IDs.
+
+Arguments are variant, M, K, CPU list, timed sample count, `normal|huge` page
+mode and the number of verification jobs. Zero timed samples performs only
+correctness checks. Each verification job changes the input, alternates bias
+on/off and overwrites the output before checking it against the independent
+reference. Output guards are checked too.
+
+Workers share immutable prepared FP32 weights. They receive disjoint ranges of
+complete output tiles, so each output keeps its original K accumulation order.
+The caller performs one range itself. Worker count is capped at the number of
+tiles; a small matrix must not start idle workers just because more CPU IDs were
+requested. The selected IDs and actual worker count appear in the JSON output.
+
+Timing includes dispatch, arithmetic and waiting for completion. Packing,
+allocation, thread creation and initial view validation happen beforehand.
+Workers spin between calls: this deliberately measures a busy pool, not the
+power use or wake-up latency of an idle inference engine. The diagnostic is not
+the engine's scheduler. It does not choose a thread count automatically.
+
+Each sample reports useful TFLOPS, median/p99/maximum call latency, process CPU
+time, involuntary context switches and minor page faults. Outputs are checked
+before and after every sample. Compare repeated runs in alternating order;
+report slow samples and latency tails as well as medians.
+
+`huge` requests transparent huge pages before first touch. The tool reads their
+size from Linux and reports the actual `AnonHugePages` bytes for its weight
+mapping. A successful request does not guarantee allocation. Compare with
+`normal` on the same machine; huge pages are not a universal speedup.
+
+An optional final argument supplies an independently measured read throughput
+in **GB/s**, for the same worker count and cache/RAM working set. Its equivalent
+FP32-weight GEMV rate is `GB/s / 2000` TFLOPS: two useful operations per four-byte
+weight. Output names this `read_control_TFLOPS`. It is an empirical comparison,
+not a physical ceiling; the tool neither measures it nor invents a value when
+the argument is omitted. Do not substitute a whole-socket memory specification
+for the bandwidth available to a VM.
+
+## AVX2 validation on Colab, 10 November 2026
+
+The AVX2 changes above were built and measured on a CPU-only Colab VM reporting
+AMD EPYC 7B12, four physical cores and eight logical CPUs. Clang 18.1.3 and GCC
+14.2.0 both used C23, O3 and strict arithmetic flags. Each comparison uses the
+same compiler for the old and new kernel; a speedup is not a compiler comparison.
+The old source is from `bf9f45b7`. The diagnostic pool, packing and allocations
+are shared by both versions. Timings include dispatch and waiting, but exclude
+packing, thread creation and initial API validation.
+
+These are medians of ten alternating AB/BA pairs, each sample lasting at least
+100 ms after warmup. All outputs are checked bitwise before and after timing.
+The table uses the requested huge-page mode; the 256×256 and 512×512 weight
+allocations are smaller than 2 MiB and actually use ordinary pages in this harness.
+Actual page allocation is recorded, rather than inferred from the request.
+
+| Workload | Compiler | Workers | Before, TFLOPS | After, TFLOPS |
+| :--- | :--- | ---: | ---: | ---: |
+| GEMV, M=256 K=256 | GCC | 1 | 0.01143 | 0.03583 |
+| GEMV, M=1024 K=1024 | GCC | 4 | 0.04249 | 0.08948 |
+| GEMV, M=1024 K=1024 | Clang | 4 | 0.10201 | 0.09699 |
+| GEMV, M=8192 K=8192 | Clang | 4 | 0.02365 | 0.02349 |
+| GEMM, rows=64 M=512 K=512 | Clang | 1 | 0.02788 | 0.04228 |
+| GEMM, rows=64 M=512 K=512 | Clang | 4 | 0.09634 | 0.15415 |
+| GEMM, rows=64 M=512 K=512 | GCC | 4 | 0.06867 | 0.14923 |
+| GEMM, rows=64 M=4096 K=4096 | Clang | 4 | 0.09848 | 0.13835 |
+
+The large GEMV gain fixes GCC's generated code. Clang GEMV has no consistent
+overall speedup; some small cases regress. GEMM improves substantially with
+both compilers. These measurements do not establish leadership across CPUs.
+
+Independent controls give the following references, all expressed in TFLOPS:
+
+| Workers | Read 4 MiB, equivalent GEMV | Read 256 MiB, equivalent GEMV | Pure FP64 FMA |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.03796 | 0.01150 | 0.05096 |
+| 2 | 0.05271 | 0.02022 | 0.10172 |
+| 4 | 0.12660 | 0.03119 | 0.20319 |
+| 8 | 0.12548 | 0.03464 | 0.20385 |
+
+The read controls use confirmed huge pages and convert GB/s to equivalent GEMV
+TFLOPS as described above. They and the FMA loop are measured references, not
+proven attainable GEMV ceilings. The VM's physical RAM bandwidth entitlement is
+unknown. Eight SMT threads share the arithmetic units of four cores; they are
+not consistently faster, and the raw data retains slow samples and latency tails.
+
+A separate comparison with PyTorch 2.14.1/MKL 2024.2 uses the same persistent
+pool and output partitions, with single-thread MKL inside each worker. On four
+workers, cached GEMV 1024² gives 0.09458 TFLOPS for Velri and 0.06948 for PyTorch;
+GEMV 8192² gives 0.02617 and 0.02852. GEMM 64×512² gives 0.15563 and 0.24200.
+PyTorch uses FP32 arithmetic and does not satisfy Velri's ordered FP64 reference
+contract. Ordinary ATen calls were also measured: their GEMV used about one CPU
+even when four threads were requested, so that comparison includes different
+parallelization. It is not evidence of a fourfold microkernel improvement.
+
+Final checks passed with Clang, GCC, GCC ASan/UBSan, baseline-only Clang and
+ARM64 GCC under QEMU. Each available x86 variant passed 491,680 exact output/guard
+comparisons. The independent reference and frozen fixture are unchanged.
+AVX-512 compiled but could not execute on this VM. The complete corrected
+comparison has 39 configurations and 1,560 timing samples. Its `v2` harness fixes
+a metadata-printing error in an earlier run and validates dimensions and workers.
+Sources, hashes, disassembly, raw samples, rejected variants and the full report
+remain local in `docs/benchmarks/avx2-finish-2026-11-10/`, excluded from Git.
+
+## Earlier exact-kernel measurements: Ryzen 9 9950X
+
+The following measurements predate the AVX2 changes described above.
 
 A matched comparison used the new C arithmetic source inside the archived Rust
 worker-pool harness on Ryzen 9 9950X. It measures complete prepared linear calls,

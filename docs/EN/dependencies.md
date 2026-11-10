@@ -2,33 +2,33 @@
 
 [Русский](../RU/dependencies.md)
 
+The compute build, CPU/Vulkan dependencies and kernel CI now belong to the separate Velri-lib project. Velri links its exported CMake target or a local checkout, without source copies; see [build instructions](velri-lib.md). The current prototype and future dependencies remain distinct.
+
 This document describes libraries and tools for Velri's future move to C and Vulkan. Technical terms are explained in the [glossary](glossary.md); the [architecture](architecture.md) describes the engine itself.
 
 **Status:** these libraries are not integrated yet. The list was checked against upstream documentation on 8 November 2026. **Proposed** means a choice for future implementation. **Candidate** means suitability still needs evaluation. The conditional VMA choice depends on the open C++ policy.
 
 ## Language and build
 
-Engine code and public headers are planned in **C17**, using structs and functions. Every memory region needs clear ownership and responsibility for release. Internal structures do not have to become public ABI. Platform calls and compiler SIMD extensions stay in small dedicated modules.
+Engine code and public headers are planned in **C23**, using structs and functions. Every memory region needs clear ownership and responsibility for release. Internal structures do not have to become public ABI. Platform calls and compiler SIMD extensions stay in small dedicated modules.
 
-The internal [backend interface](backends.md) also uses C17, opaque resources and function tables. This does not turn the application API into a stable ABI for third-party plugins.
+The internal [backend interface](backends.md) also uses C23, opaque resources and function tables. This does not turn the application API into a stable ABI for third-party plugins.
 
 **CMake and Ninja** are used by the first [C CPU linear module](cpu-linear.md); the full engine build remains to be implemented. CMake describes how to build the library, applications and tests, and how to generate compute kernels. Ninja executes those actions.
 
 Set three properties for our C targets:
 
 ```text
-C_STANDARD=17
+C_STANDARD=23
 C_STANDARD_REQUIRED=ON
 C_EXTENSIONS=OFF
 ```
 
-This requires C17 without enabling language extensions by default. Without `C_STANDARD_REQUIRED`, CMake may lower the requested standard. The C17 property became available in CMake 3.21; Velri's minimum version will be fixed with the first working CI. [CMake documentation](https://cmake.org/cmake/help/latest/prop_tgt/C_STANDARD.html).
+This requires C23 without enabling language extensions by default. Without `C_STANDARD_REQUIRED`, CMake may lower the requested standard. The C23 property became available in CMake 3.21, which is Velri's minimum CMake version. Configuration also checks that the compiler accepts `-std=c23`. CMake may emit the equivalent `-std=c2x` spelling for these compilers. [CMake documentation](https://cmake.org/cmake/help/latest/prop_tgt/C_STANDARD.html).
 
-Initial build coverage:
+The C23 build uses Clang 18+ or GCC 14+. These releases accept C23 mode; this does not claim that every C23 feature and library facility is implemented by every supported toolchain. [Clang 18 release notes](https://releases.llvm.org/18.1.8/tools/clang/docs/ReleaseNotes.html#c23-feature-support), [GCC 14 release notes](https://gcc.gnu.org/gcc-14/changes.html).
 
-- Clang on Linux and Windows;
-- Android NDK Clang for Android arm64;
-- GCC to check portable C code.
+CI specifies Clang 18 and GCC 14 on Linux, including sanitizers and a baseline-only build. The ARM64 job uses GCC 14 and QEMU. Windows Clang and Android NDK Clang builds remain planned and need their own toolchain checks.
 
 Claim MSVC and additional ABI support after verification in CI. A successful build establishes that the program can be built; performance still requires a device measurement.
 
