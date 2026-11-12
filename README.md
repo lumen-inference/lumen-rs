@@ -1,10 +1,11 @@
 # Velri
 
-Velri is an inference engine being designed in **C23**, with **CPU and Vulkan** as its first compute backends. It targets Windows, Linux and Android, including models whose weights do not fit entirely in GPU memory. Additional backends connect through a common internal C interface.
+Velri is an inference engine being designed in **C23**, with **CPU and Vulkan** as its first compute backends. It targets Windows, Linux and Android, including models whose weights do not fit entirely in GPU memory. Backends are implemented and managed entirely by Velri-lib through its common internal C interface.
 
-Computation belongs to the separate **[Velri-lib](https://github.com/velri-inference/velri-lib)** project: operations, reusable
-mathematical blocks, graphs, preparation, execution and device backends. Velri
-owns model descriptions, loading and inference requests. See the
+The separate **[Velri-lib](https://github.com/velri-inference/velri-lib)** project provides
+mathematical operations and tools for building, preparing and executing kernel
+launch graphs. Velri uses those operations to describe reusable model blocks and
+architectures, and owns model loading and inference requests. See the
 [project boundary and build instructions](docs/EN/velri-lib.md).
 
 Documentation: **[English](docs/EN/README.md)** · **[Русский](docs/RU/README.md)**
