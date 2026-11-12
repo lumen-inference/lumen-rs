@@ -2,7 +2,7 @@
 
 [Русский](../../RU/models/qwen4_exp.md)
 
-These are family implementation requirements, not a description of a working execution path. The C17 engine composes it from [common blocks](../blocks.md); the [backend registry](../backends.md) determines support for concrete operations and representations, starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
+These are family implementation requirements, not a description of a working execution path. The C23 engine composes it from [common blocks](../blocks.md); the [backend registry](../backends.md) determines support for concrete operations and representations, starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
 
 The **`qwen4_exp`** architecture (`Qwen3.8-Flash-Next`) extends the hybrid [`qwen3_next` / `qwen3_5_moe`](qwen3_next.md) foundation with three additional modules: Query-Sparse Attention (`QSA`), four-stream residual connections (`Hyper-Connections`), and n-gram Per-Layer Embeddings (`PLE`).
 

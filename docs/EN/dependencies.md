@@ -53,7 +53,7 @@ This is the proposed set for the first implementation. Build tools in this table
 
 A CPU build does not need the Vulkan SDK. Vulkan build headers and tools belong on the developer's machine. Users need a working Vulkan loader and driver: `volk` does not provide the driver.
 
-Each backend is a separate build module with private dependencies. Disabled modules introduce no headers, libraries, or code-generation tools into the build, require no SDK, and add no libraries to the distributed engine. The enabled registration list is generated at build time; new names are not inserted manually into models or the planner. The common C interface and checks for this integration are described in [backends.md](backends.md).
+Each backend is a separate build module inside Velri-lib with private dependencies. The library exports required link dependencies through its CMake targets; Velri does not maintain a second SDK or module registry. Disabled modules introduce no headers, libraries, or code-generation tools into the build, require no SDK, and add no libraries to the distributed engine. The enabled registration list is generated when building Velri-lib; new names are not inserted manually into models or the planner. The common C interface and checks for this integration are described in [backends.md](backends.md).
 
 When integrating shaderc, check licenses of all included components, not only shaderc itself.
 
@@ -65,7 +65,7 @@ The preferred option is **[Vulkan Memory Allocator](https://github.com/GPUOpen-L
 
 The next choice depends on project policy:
 
-- **If C++ is allowed inside libraries**, integrate VMA as a private Vulkan-backend module. This is an internal implementation boundary in Velri; VMA's source remains open. Separately check whether the distributed binary requires a C++ runtime.
+- **If C++ is allowed inside libraries**, integrate VMA as a private Vulkan-backend module. This is an internal implementation boundary in Velri-lib; VMA's source remains open. Separately check whether the distributed binary requires a C++ runtime.
 - **If C++ is limited to build tools**, a bounded Vulkan allocator written in C is needed. It must handle alignment, memory types, dedicated allocations and memory accesses that have not completed.
 
 There is no plan to maintain two GPU allocators without a need. A VMA-based implementation would not be entirely C.

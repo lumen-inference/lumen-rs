@@ -2,7 +2,7 @@
 
 [Русский](../RU/architecture.md)
 
-The computation layer is a separate project, **Velri-lib**. It owns operations, reusable mathematical blocks, graphs, preparation, device execution and compute memory. Velri owns model descriptions, file loading and inference requests. [Project boundary and build](velri-lib.md).
+**Velri-lib** provides mathematical operations and tools for building, preparing and executing kernel launch graphs. Velri assembles these operations into reusable blocks and model architectures, loads files and manages inference requests. [Project boundary and build](velri-lib.md).
 
 Velri is an engine for running neural network models. It should load a model, perform its computations on the available hardware, and return a result to the application. For a language model, this usually means scores for the next token, from which a continuation can be selected.
 
@@ -148,7 +148,7 @@ or retain a second kernel implementation. [Build instructions](velri-lib.md).
 | Velri: `src/model/`, `src/format/` | Model adapters, topology, configuration and weight files |
 | Velri: `src/runtime/`, `apps/` | Requests, batching policy, generation and applications |
 | Velri-lib: `include/velri_lib/` | Computation-library C interface |
-| Velri-lib: `src/core/`, `src/ops/`, `src/blocks/`, `src/graph/` | Values, storage, mathematical mechanisms and graphs |
+| Velri-lib: `src/core/`, `src/ops/`, `src/graph/` | Values, storage, mathematical operations and the graph builder |
 | Velri-lib: `src/plan/`, `src/runtime/` | Memory and kernel selection, jobs, execution slots and completion |
 | Velri-lib: `src/backend/`, `src/platform/` | Device execution, CPU workers, GPU queues and OS facilities |
 

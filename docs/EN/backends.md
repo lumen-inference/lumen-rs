@@ -4,7 +4,7 @@
 
 **Project ownership:** the computation contracts and implementations on this page belong to **Velri-lib**. Velri uses them through the library API; it owns model and request policy. See the [project boundary](velri-lib.md).
 
-A backend executes operations on a device. Velri's first two backends are **CPU** and **Vulkan**. The engine and internal backend interface use C23. Vulkan GPU kernels use GLSL and ship as SPIR-V.
+A backend executes operations on a device. Velri-lib's first two backends are **CPU** and **Vulkan**. The library manages their registration, settings, devices and execution; Velri uses its common C API. The engine and internal backend interface use C23. Vulkan GPU kernels use GLSL and ship as SPIR-V.
 
 **Status: interface design.** The C types and `src/` layout below are not implemented. They define proposed boundaries for the new engine, not the current Rust API. Terms are defined in the [glossary](glossary.md).
 
@@ -12,7 +12,7 @@ The central requirement is that adding a backend for existing operations must no
 
 ## What a backend author implements
 
-Add a directory such as `src/backend/example/` with five parts:
+In the **Velri-lib** repository, add a directory such as `src/backend/example/` with five parts:
 
 1. **Registration and device discovery:** the backend's name and its available devices.
 2. **Memory:** allocation and release of its buffers, with transfers to and from ordinary CPU memory.
@@ -20,22 +20,24 @@ Add a directory such as `src/backend/example/` with five parts:
 4. **Preparation and execution:** selection of its kernels and execution of prepared jobs.
 5. **Contract tests:** numerical correctness, memory bounds, errors and resource lifetimes.
 
-Connect the registration to the build. Common preparation then discovers the module through the registry. No `if backend == example` branch belongs in `model/`, `plan/` or `runtime/`.
+Connect the registration to the library build. Common preparation then discovers the module through the Velri-lib registry. Nothing needs registration in the engine. No `if backend == example` branch belongs in the engine's `model/` or the library's common `plan/` and `runtime/`.
 
 This reduces the surrounding integration work. Fast kernels still need implementation and verification: the interface does not translate GLSL into code for any other accelerator.
 
 ## Shared and backend responsibilities
 
-| Shared Velri responsibility | Backend responsibility |
+| Shared Velri-lib responsibility | Backend responsibility |
 | :--- | :--- |
 | Operation formulas, tensor shapes and permitted state changes | Concrete implementations of operations |
-| Model assembly from blocks | Selection of its instructions or GPU kernels |
+| Operation graph validation and launch graph preparation | Selection of its instructions or GPU kernels |
 | Placement across permitted devices | Checking whether its device supports the proposed work |
 | Resource lifetimes, total memory budget and job dependencies | Physical allocation and execution of dependencies through device facilities |
-| Sessions, request limits, cancellation and token selection | Running accepted work and reporting its actual completion |
+| Execution slots, accepted-work tracking and completion on cancellation | Running accepted work and reporting its actual completion |
 | Diagnostics and common tests | Rejection reasons, device properties and measurement data |
 
-A backend does not read model-family configuration or infer QSA, GDN or MoE semantics from a model name. It receives operations and parameters. Device settings, such as CPU thread count, are handled separately when creating the context.
+Model assembly from blocks, inference sessions, batching policy and token selection remain in Velri. The engine specifies permitted devices and resource limits through the library API; Velri-lib enforces those limits during graph execution.
+
+A backend does not read model-family configuration or infer QSA, GDN or MoE semantics from a model name. It receives operations and parameters. Each module in Velri-lib validates its device settings, such as CPU thread count, when creating the context.
 
 ## One C interface with several function groups
 
@@ -54,7 +56,7 @@ These names describe roles; the first implementation will fix exact signatures. 
 
 The table has no separate `gemm`, `rope`, `qsa` or similar entry for every kernel. A common descriptor identifies the operation, and preparation selects its handler. Adding an operation does not expand the backend function table. Its validation and reference are added to the common operation registry; each backend either supports the new kind or explicitly rejects it.
 
-Internal headers belong in `src/backend/`. Application headers remain in `include/velri/`. The common interface exposes neither `VkBuffer`, API-specific queues nor SIMD types. Initially all backends build from the same source version. A stable ABI for third-party binary plugins is not promised.
+Internal backend headers belong in the Velri-lib repository's `src/backend/`. The engine uses the library's public headers under `include/velri_lib/`; its own model and request API lives in `include/velri/` in the Velri repository. The common interface exposes neither `VkBuffer`, API-specific queues nor SIMD types. Initially all backends build from the same library source version. A stable ABI for third-party binary plugins is not promised.
 
 ## Querying support for an operation
 
@@ -156,7 +158,7 @@ Vulkan translates common dependencies into the required barriers, waits and memo
 
 ## Registration, build and configuration
 
-Proposed layout:
+Proposed layout within the Velri-lib repository:
 
 ```text
 src/backend/

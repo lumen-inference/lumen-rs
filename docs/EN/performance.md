@@ -4,7 +4,7 @@
 
 This document defines measurement rules for the move to C and Vulkan. Terms are explained in the [glossary](glossary.md).
 
-**Status:** the C runtime and Vulkan backend are not implemented. Existing CPU measurements describe the old Rust implementation and are stored in [cpu-performance.md](cpu-performance.md) and the experiment archive (`../benchmarks/`). They do not establish performance of the future implementation. CLI commands `probe` and `bench` are still being designed.
+**Status:** the first C CPU linear module and its measurements are described in [cpu-linear.md](cpu-linear.md). The C runtime and Vulkan backend are not implemented. Historical Rust measurements remain in [cpu-performance.md](cpu-performance.md) and the experiment archive (`../benchmarks/`); they do not establish performance of the C module or the future engine. CLI commands `probe` and `bench` are still being designed.
 
 ## What we measure
 
@@ -72,6 +72,30 @@ Profilers and validation affect execution. Confirm an apparent improvement in a 
 Before changing code, state a testable cause: repeated packing, an unnecessary intermediate buffer, too little work per job, uneven matrix partitions or a slow kernel region. Changing the language, compiler or alignment does not by itself explain lost time.
 
 ## Making measurements reproducible
+
+### Keep a kernel comparison table
+
+Each optimization report includes a table of the measured implementations, including
+the baseline, retained candidates, rejected candidates and external implementations
+that were tested. Identify a kernel by its source revision or hash and describe the
+change; the compiler name alone does not identify a different algorithm.
+
+For every row, show the workload and dimensions, hardware/ISA, compiler, worker count,
+median TFLOPS and variation, numerical contract and bitwise-check result. A shared
+heading may hold conditions that are identical for all rows. Include the relevant
+compute or memory reference in TFLOPS and state whether it is theoretical, conditional
+or measured. An unknown physical ceiling stays unknown.
+
+Keep a run identifier and a link to the raw measurements. Results from separate runs
+must remain distinguishable; do not choose the best sample from each and call it a
+paired comparison. Include regressions. An implementation awaiting code or measurement
+gets an explicit pending entry, with no invented speed or correctness result.
+
+Update the table as candidates are evaluated. Raw benchmark data remains local under
+`docs/benchmarks/`, excluded from commits; concise published summaries stay synchronized
+between English and Russian documentation.
+
+### Record the conditions
 
 Keep the following in the report:
 

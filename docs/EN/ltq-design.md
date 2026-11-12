@@ -4,7 +4,7 @@
 
 This document explains why LTQ is used and what quantization experiments showed. The tables apply to the stated models and research conditions. See the [glossary](glossary.md) for definitions and the separate [specification](ltq-format.md) for reading file bytes.
 
-> The migration to C17 with CPU and Vulkan backends preserves the LTQ v1 byte specification. The research GPU results below are not measurements of the new Vulkan backend.
+> The migration to C23 with CPU and Vulkan backends preserves the LTQ v1 byte specification. The research GPU results below are not measurements of the new Vulkan backend.
 
 **Implementation status:** this document records the LTQ design and research workflow. The new engine's native quantizer is not implemented; the earlier Rust `lumen-quantize` crate remains a placeholder and does not define its future API. Quantizer development is a separate track from first inference; see [roadmap.md](roadmap.md).
 
@@ -63,7 +63,7 @@ LTQ was compared against published quantizations of `Qwen3.8-27B` at matched siz
 
 ## 3. Planned Native Quantizer Pipeline
 
-The pipeline brings the research algorithm into the C17 engine. Forward passes use [common model blocks](blocks.md), while quantization operations are checked through the [backend registry](backends.md). CPU or Vulkan inference support alone does not imply support for Hessians, backward passes, or Viterbi search. An unsupported stage needs a supported path selected in advance or an explicit preparation error.
+The pipeline brings the research algorithm into the C23 engine. Forward passes use [common model blocks](blocks.md), while quantization operations are checked through the [backend registry](backends.md). CPU or Vulkan inference support alone does not imply support for Hessians, backward passes, or Viterbi search. An unsupported stage needs a supported path selected in advance or an explicit preparation error.
 
 Processing proceeds layer by layer, with one current layer's weights in working memory. Activations, Hessians, profiles, and temporary representations require separate memory budgeting. The algorithm proceeds as follows:
 

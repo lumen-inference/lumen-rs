@@ -260,7 +260,7 @@ Sections: [model and text](#model-and-text), [model blocks](#model-blocks), [eng
 
 **Opaque type** — a type whose internal structure is hidden from API users. The application uses the provided functions instead of modifying internal structure fields.
 
-**C17, CMake, Ninja** — the C language standard and tools for organizing and executing a build. **CI** — automated builds and checks after changes. Project dependencies and their status are listed in [dependencies.md](dependencies.md).
+**C23, CMake, Ninja** — the C language standard and tools for organizing and executing a build. **CI** — automated builds and checks after changes. Project dependencies and their status are listed in [dependencies.md](dependencies.md).
 
 **Cross-compilation** — building a program for a different platform. In this context, the **host** is the build machine and the **target** is the execution platform. A code generator must run on the host even when its output is intended for the target.
 

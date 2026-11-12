@@ -2,7 +2,7 @@
 
 [Русский](../../RU/models/qwen3_next.md)
 
-These are family implementation requirements, not a list of runnable models. In the C17 engine, the family defines the order and parameters of [common blocks](../blocks.md). Preparation checks operations through the [backend registry](../backends.md), starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
+These are family implementation requirements, not a list of runnable models. In the C23 engine, the family defines the order and parameters of [common blocks](../blocks.md). Preparation checks operations through the [backend registry](../backends.md), starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
 
 Models in this family follow a **3 : 1 hybrid schedule** defined by the `layer_types` array in the model configuration:
 - Three consecutive layers use linear recurrent attention **`GatedDeltaNet` (GDN)** (`linear_attention`), which requires no growing KV cache.

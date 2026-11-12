@@ -4,7 +4,7 @@
 
 Start with the [common block overview](../blocks.md) to see how these mechanisms compose a model. This reference covers differences between families and the parameters needed to implement them. Common terms are defined in the [glossary](../glossary.md).
 
-These are family references and implementation requirements, not a list of working models. The new C17 engine composes models from common blocks; CPU and Vulkan are its first planned compute backends. [blocks.md](../blocks.md) and [architecture.md](../architecture.md) define composition and ownership; [backends.md](../backends.md) defines the device boundary. Module names below describe their meaning, not public C types.
+These are family references and implementation requirements, not a list of working models. The new C23 engine composes models from common blocks; CPU and Vulkan are its first planned compute backends. [blocks.md](../blocks.md) and [architecture.md](../architecture.md) define composition and ownership; [backends.md](../backends.md) defines the device boundary. Module names below describe their meaning, not public C types.
 
 A family describes layer order and shared-block parameters. QSA is not a universal sparse-attention algorithm; another algorithm needs its own composition of operations. State sizes and memory access depend on model parameters and device capabilities.
 

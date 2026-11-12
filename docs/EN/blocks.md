@@ -2,7 +2,7 @@
 
 [Русский](../RU/blocks.md)
 
-Common mathematical blocks belong to Velri-lib; model-family adapters in Velri choose, parameterize and connect them. See the [project boundary](velri-lib.md).
+Velri-lib provides mathematical operations and a graph builder. Velri describes reusable blocks through this API; model-family adapters choose, parameterize and connect them. A new block made from supported operations requires no library changes. See the [project boundary](velri-lib.md).
 
 A new architecture should not require writing the entire engine again. We want to describe a model using reusable parts: choose suitable blocks, set their parameters, and connect them in the required order.
 

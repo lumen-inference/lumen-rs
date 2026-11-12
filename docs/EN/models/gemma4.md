@@ -2,7 +2,7 @@
 
 [Русский](../../RU/models/gemma4.md)
 
-This is a reference for the architecture and its implementation requirements, not a report of working Velri execution. The C17 engine composes the model from [common blocks](../blocks.md); support for concrete operations and representations is checked through the [backend registry](../backends.md), starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
+This is a reference for the architecture and its implementation requirements, not a report of working Velri execution. The C23 engine composes the model from [common blocks](../blocks.md); support for concrete operations and representations is checked through the [backend registry](../backends.md), starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
 
 The **Gemma 4** family comprises five models (`E2B`, `E4B`, `12B`, `26B-A4B`, `31B`) that alternate **sliding-window attention layers (`sliding`)** with **global full-attention layers (`full`)**.
 
